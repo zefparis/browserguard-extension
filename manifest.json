@@ -1,0 +1,41 @@
+{
+  "manifest_version": 3,
+  "name": "BrowserGuard",
+  "version": "0.1.0",
+  "description": "Passive behavioral verification with cognitive step-up for HCS-U7.",
+
+  "permissions": [
+    "storage",
+    "activeTab",
+    "scripting"
+  ],
+
+  "host_permissions": [
+    "https://api.hcs-u7.org/hv/*"
+  ],
+
+  "background": {
+    "service_worker": "src/background.js",
+    "type": "module"
+  },
+
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["src/content-script.js"],
+      "run_at": "document_idle"
+    }
+  ],
+
+  "action": {
+    "default_title": "BrowserGuard",
+    "default_popup": "src/step-up.html"
+  },
+
+  "web_accessible_resources": [
+    {
+      "resources": ["src/step-up.html"],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}
