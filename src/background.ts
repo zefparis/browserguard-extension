@@ -84,6 +84,13 @@ let tenantId: string = 'browserguard-default';
 let lastSnapshot: BehaviorSnapshot | null = null;
 let beaconTimer: ReturnType<typeof setInterval> | null = null;
 let stepUpInProgress: boolean = false;
+let stepUpWindowId: number | null = null;
+let stepUpSafetyTimer: ReturnType<typeof setTimeout> | null = null;
+
+// Safety timeout: if no result/error is received within 90s, force-reset
+// stepUpInProgress so future beacons can trigger a new step-up.
+// 90s > 60s (step-up.ts timeout) to let the normal close flow happen first.
+const STEP_UP_SAFETY_TIMEOUT_MS = 90_000;
 
 // ─── Session ID generation ──────────────────────────────────────────
 
@@ -149,8 +156,14 @@ function computeStats(arr: number[]): { avg: number | null; variance: number | n
 // ─── Beacon to backend ──────────────────────────────────────────────
 
 async function sendBeacon(): Promise<void> {
-  if (!lastSnapshot || lastSnapshot.totalEvents === 0) return;
-  if (stepUpInProgress) return; // pause beacons during step-up
+  if (!lastSnapshot || lastSnapshot.totalEvents === 0) {
+    console.debug('[BrowserGuard] Beacon skipped: no snapshot or zero events');
+    return;
+  }
+  if (stepUpInProgress) {
+    console.debug('[BrowserGuard] Beacon skipped: step-up in progress');
+    return;
+  }
 
   ensureSession();
 
@@ -177,19 +190,64 @@ async function sendBeacon(): Promise<void> {
     }
 
     const data: BackendResponse = await resp.json();
+    console.info('[BrowserGuard] Beacon response:', JSON.stringify({
+      step_up_required: data.step_up_required,
+      step_up_url: data.step_up_url,
+      trust_score_normalized: data.trust_score_normalized,
+      referenceWindowActive: data.referenceWindowActive,
+      invalidated: data.invalidated,
+      stepUpInProgress,
+    }));
 
     // Check for step-up requirement
     if (data.step_up_required === true && data.step_up_url && !stepUpInProgress) {
+      console.info('[BrowserGuard] Step-up required, triggering popup');
       triggerStepUp(data.step_up_url);
+    } else if (data.step_up_required === true && !data.step_up_url) {
+      console.warn('[BrowserGuard] Step-up required but no step_up_url in response');
+    } else if (data.step_up_required === true && stepUpInProgress) {
+      console.debug('[BrowserGuard] Step-up required but already in progress, skipping');
     }
   } catch (err) {
     console.error('[BrowserGuard] Beacon error:', err);
   }
 }
 
+// ─── Debug exposure ─────────────────────────────────────────────────
+// Expose sendBeacon and key state on globalThis for manual testing from
+// the DevTools service worker console. This allows calling the REAL
+// sendBeacon() (which processes the response and triggers step-up)
+// instead of a raw fetch() that bypasses the step-up logic.
+//
+// Usage in SW DevTools console:
+//   browserguard.test.triggerBeacon()        — calls sendBeacon() with current lastSnapshot
+//   browserguard.test.setSnapshot({...})     — set a fake snapshot for testing
+//   browserguard.test.resetStepUp()          — force-reset stepUpInProgress
+//   browserguard.test.state()                — dump current state
+(self as any).browserguard = {
+  test: {
+    triggerBeacon: () => sendBeacon(),
+    setSnapshot: (snap: BehaviorSnapshot) => { lastSnapshot = snap; },
+    resetStepUp: () => {
+      stepUpInProgress = false;
+      stepUpWindowId = null;
+      if (stepUpSafetyTimer) { clearTimeout(stepUpSafetyTimer); stepUpSafetyTimer = null; }
+      console.info('[BrowserGuard] stepUpInProgress force-reset');
+    },
+    state: () => ({
+      sessionId,
+      stepUpInProgress,
+      stepUpWindowId,
+      hasSnapshot: !!lastSnapshot,
+      snapshotEvents: lastSnapshot?.totalEvents ?? 0,
+    }),
+  },
+};
+
 // ─── Step-up trigger ────────────────────────────────────────────────
 
 function triggerStepUp(stepUpUrl: string): void {
+  console.info('[BrowserGuard] triggerStepUp called, stepUpUrl=', stepUpUrl);
   stepUpInProgress = true;
 
   // Build the step-up.html URL with query params
@@ -202,6 +260,20 @@ function triggerStepUp(stepUpUrl: string): void {
   });
 
   const fullUrl = `${extensionUrl}?${params.toString()}`;
+  console.info('[BrowserGuard] Opening step-up popup:', fullUrl);
+
+  // Safety timer: force-reset stepUpInProgress after 90s regardless of
+  // whether a result/error message was received. This prevents the flag
+  // from being stuck at true forever if the popup is closed manually,
+  // the SW is killed by MV3, or the iframe fails silently.
+  if (stepUpSafetyTimer) clearTimeout(stepUpSafetyTimer);
+  stepUpSafetyTimer = setTimeout(() => {
+    if (stepUpInProgress) {
+      console.warn('[BrowserGuard] Step-up safety timeout — force-resetting stepUpInProgress');
+      stepUpInProgress = false;
+      stepUpWindowId = null;
+    }
+  }, STEP_UP_SAFETY_TIMEOUT_MS);
 
   // Open as a popup window — zero friction, auto-closes after result
   chrome.windows.create({
@@ -214,9 +286,31 @@ function triggerStepUp(stepUpUrl: string): void {
     if (chrome.runtime.lastError) {
       console.error('[BrowserGuard] Failed to open step-up window:', chrome.runtime.lastError);
       stepUpInProgress = false;
+      stepUpWindowId = null;
+      if (stepUpSafetyTimer) clearTimeout(stepUpSafetyTimer);
+      return;
+    }
+    if (window) {
+      stepUpWindowId = window.id ?? null;
+      console.info('[BrowserGuard] Step-up popup opened, windowId=', window.id);
     }
   });
 }
+
+// ─── Step-up popup close listener ───────────────────────────────────
+// If the popup is closed (manually, by timeout, or by crash), reset
+// stepUpInProgress so future beacons can trigger a new step-up.
+chrome.windows.onRemoved.addListener((windowId) => {
+  if (windowId === stepUpWindowId) {
+    console.info('[BrowserGuard] Step-up popup closed, windowId=', windowId);
+    stepUpInProgress = false;
+    stepUpWindowId = null;
+    if (stepUpSafetyTimer) {
+      clearTimeout(stepUpSafetyTimer);
+      stepUpSafetyTimer = null;
+    }
+  }
+});
 
 // ─── Step-up result handling ────────────────────────────────────────
 
@@ -231,6 +325,7 @@ function isStepUpSuccess(result: StepUpResultMessage): boolean {
 }
 
 async function handleStepUpResult(result: StepUpResultMessage): Promise<void> {
+  console.info('[BrowserGuard] Step-up result received:', result.decision, 'score=', result.score);
   const success = isStepUpSuccess(result);
 
   // Notify backend of the step-up result
@@ -249,11 +344,17 @@ async function handleStepUpResult(result: StepUpResultMessage): Promise<void> {
         confidence: result.confidence,
       }),
     });
+    console.info('[BrowserGuard] Step-up result notified to backend, success=', success);
   } catch (err) {
     console.error('[BrowserGuard] Failed to notify backend of step-up result:', err);
   }
 
   stepUpInProgress = false;
+  stepUpWindowId = null;
+  if (stepUpSafetyTimer) {
+    clearTimeout(stepUpSafetyTimer);
+    stepUpSafetyTimer = null;
+  }
 }
 
 // ─── Message listener ───────────────────────────────────────────────
@@ -270,8 +371,14 @@ chrome.runtime.onMessage.addListener((message, _sender, _sendResponse) => {
   }
 
   if (message.type === 'browserguard_stepup_error') {
-    console.error('[BrowserGuard] Step-up error:', (message as StepUpErrorMessage).error, (message as StepUpErrorMessage).detail);
+    const errMsg = message as StepUpErrorMessage;
+    console.error('[BrowserGuard] Step-up error:', errMsg.error, errMsg.detail);
     stepUpInProgress = false;
+    stepUpWindowId = null;
+    if (stepUpSafetyTimer) {
+      clearTimeout(stepUpSafetyTimer);
+      stepUpSafetyTimer = null;
+    }
     return false;
   }
 
@@ -292,5 +399,7 @@ beaconTimer = setInterval(sendBeacon, BEACON_INTERVAL_MS);
 
 // Clean up on suspend (MV3 service workers can be killed)
 self.addEventListener('beforeunload', () => {
+  console.info('[BrowserGuard] Service worker suspending — state will be lost');
   if (beaconTimer) clearInterval(beaconTimer);
+  if (stepUpSafetyTimer) clearTimeout(stepUpSafetyTimer);
 });
