@@ -4,3 +4,5 @@ dist/
 .DS_Store
 .env
 .env.local
+extension-key.pem
+extension-pubkey.b64

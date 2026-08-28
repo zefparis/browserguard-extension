@@ -69,6 +69,45 @@
   loading.style.display = 'none';
   container.style.display = 'block';
 
+  // ─── Iframe error handling ──────────────────────────────────────
+  // If the iframe fails to load (CSP, network, etc.), show a visible
+  // error instead of a silent "broken image" icon.
+  iframe.addEventListener('error', () => {
+    loading.style.display = 'flex';
+    loading.innerHTML = '<div style="color:#ef4444;font-size:13px;text-align:center;padding:20px;">'
+      + 'Erreur: impossible de charger le challenge.<br>'
+      + 'URL: ' + embedUrl
+      + '</div>';
+    container.style.display = 'none';
+    chrome.runtime.sendMessage({
+      type: 'browserguard_stepup_error',
+      error: 'iframe_load_failed',
+      detail: `Failed to load iframe from ${stepUpUrl}`,
+      sessionId,
+    });
+  });
+
+  // Detect load failure via timeout (iframe 'error' event is unreliable
+  // for cross-origin iframes — Chrome often doesn't fire it)
+  let iframeLoaded = false;
+  iframe.addEventListener('load', () => { iframeLoaded = true; });
+  setTimeout(() => {
+    if (!iframeLoaded) {
+      loading.style.display = 'flex';
+      loading.innerHTML = '<div style="color:#ef4444;font-size:13px;text-align:center;padding:20px;">'
+        + 'Erreur: le challenge n\'a pas répondu dans les 10s.<br>'
+        + 'URL: ' + embedUrl
+        + '</div>';
+      container.style.display = 'none';
+      chrome.runtime.sendMessage({
+        type: 'browserguard_stepup_error',
+        error: 'iframe_load_timeout',
+        detail: `Iframe did not load within 10s from ${stepUpUrl}`,
+        sessionId,
+      });
+    }
+  }, 10_000);
+
   // ─── Listen for postMessage from the GateGuard iframe ─────────────
 
   window.addEventListener('message', (event) => {
