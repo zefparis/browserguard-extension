@@ -37,6 +37,9 @@ interface BehaviorSnapshot {
   scrollEventCount: number;
   totalEvents: number;
   timestamp: string;
+  viewportWidth?: number;
+  viewportHeight?: number;
+  pixelRatio?: number;
 }
 
 interface BackendResponse {
@@ -96,12 +99,16 @@ function ensureSession(): void {
 }
 
 // ─── Device context ─────────────────────────────────────────────────
+// Service workers have no window/document/DOM. Viewport dimensions are
+// captured by the content script (which runs in the page context) and
+// passed in the behavior snapshot. We use those values if available,
+// otherwise fall back to defaults.
 
-function getDeviceContext() {
+function getDeviceContext(snap?: BehaviorSnapshot) {
   return {
-    viewportWidth: window.screen?.width ?? 1920,
-    viewportHeight: window.screen?.height ?? 1080,
-    pixelRatio: 1, // service worker doesn't have window.devicePixelRatio
+    viewportWidth: snap?.viewportWidth ?? 1920,
+    viewportHeight: snap?.viewportHeight ?? 1080,
+    pixelRatio: snap?.pixelRatio ?? 1,
     platform: 'desktop' as const,
   };
 }
@@ -151,7 +158,7 @@ async function sendBeacon(): Promise<void> {
     sessionId,
     source: 'browserguard' as const,
     snapshot: buildBackendSnapshot(lastSnapshot),
-    deviceContext: getDeviceContext(),
+    deviceContext: getDeviceContext(lastSnapshot),
   };
 
   try {

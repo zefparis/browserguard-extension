@@ -50,6 +50,9 @@ interface BehaviorSnapshot {
   scrollEventCount: number;
   totalEvents: number;
   timestamp: string;
+  viewportWidth: number;
+  viewportHeight: number;
+  pixelRatio: number;
 }
 
 // ─── State ──────────────────────────────────────────────────────────
@@ -205,6 +208,9 @@ function buildSnapshot(): BehaviorSnapshot {
     scrollEventCount: scrollEvents.length,
     totalEvents: keystrokes.length + mouseEvents.length + scrollEvents.length,
     timestamp: new Date().toISOString(),
+    viewportWidth: window.innerWidth,
+    viewportHeight: window.innerHeight,
+    pixelRatio: window.devicePixelRatio || 1,
   };
 }
 
