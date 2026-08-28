@@ -4,12 +4,13 @@
   "description": "BrowserGuard — Chrome extension for passive behavioral verification with cognitive step-up",
   "type": "module",
   "scripts": {
-    "build": "tsc && node scripts/copy-assets.js",
-    "dev": "tsc --watch",
+    "build": "tsc --noEmit && node scripts/build.js",
+    "dev": "node scripts/build.js --watch",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
     "@types/chrome": "^0.0.287",
+    "esbuild": "^0.28.2",
     "typescript": "^5.4.0"
   }
 }
