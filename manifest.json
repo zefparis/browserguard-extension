@@ -27,8 +27,7 @@
   ],
 
   "action": {
-    "default_title": "BrowserGuard",
-    "default_popup": "src/step-up.html"
+    "default_title": "BrowserGuard"
   },
 
   "web_accessible_resources": [

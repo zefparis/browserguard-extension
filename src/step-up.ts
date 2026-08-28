@@ -29,13 +29,21 @@
 
   if (!stepUpUrl) {
     console.error('[step-up] Missing stepUpUrl query param');
+    // Show visual error instead of silently closing
+    const loading = document.getElementById('loading');
+    if (loading) {
+      loading.innerHTML = '<div style="color:#ef4444;font-size:14px;text-align:center;padding:20px;">'
+        + 'Erreur: cette page ne peut pas être ouverte directement.<br>'
+        + 'Elle est appelée automatiquement par BrowserGuard lors d\'un step-up.'
+        + '</div>';
+    }
     chrome.runtime.sendMessage({
       type: 'browserguard_stepup_error',
       error: 'missing_stepup_url',
       detail: 'stepUpUrl query param is required',
       sessionId,
     });
-    window.close();
+    // Don't auto-close — let the user see the error
     return;
   }
 
