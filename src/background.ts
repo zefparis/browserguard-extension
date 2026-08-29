@@ -227,7 +227,35 @@ async function sendBeacon(): Promise<void> {
 (self as any).browserguard = {
   test: {
     triggerBeacon: () => sendBeacon(),
-    setSnapshot: (snap: BehaviorSnapshot) => { lastSnapshot = snap; },
+    setSnapshot: (snap: BehaviorSnapshot) => {
+      // Validate required array fields — computeStats() crashes with a cryptic
+      // "Cannot read properties of undefined (reading 'length')" if these are
+      // missing or wrong type (e.g. passing *Avg numbers instead of arrays).
+      const arrayFields: (keyof BehaviorSnapshot)[] = [
+        'keystrokeIntervals', 'keystrokeHolds', 'mouseSpeeds',
+        'mouseCurvatures', 'scrollSpeeds',
+      ];
+      for (const field of arrayFields) {
+        const val = (snap as any)[field];
+        if (!Array.isArray(val)) {
+          throw new Error(
+            `setSnapshot: field "${field}" must be a number[] (got ${typeof val}). ` +
+            'Pass raw arrays, not pre-aggregated *Avg values. ' +
+            'Example: keystrokeIntervals: [180, 175, 185, ...] not keystrokeIntervalAvg: 180.'
+          );
+        }
+      }
+      if (typeof snap.totalEvents !== 'number' || snap.totalEvents === 0) {
+        throw new Error('setSnapshot: totalEvents must be a non-zero number (sendBeacon skips zero-event snapshots)');
+      }
+      lastSnapshot = snap;
+      console.info('[BrowserGuard] Snapshot set:', {
+        totalEvents: snap.totalEvents,
+        keystrokeIntervals: snap.keystrokeIntervals.length,
+        mouseSpeeds: snap.mouseSpeeds.length,
+        scrollSpeeds: snap.scrollSpeeds.length,
+      });
+    },
     resetStepUp: () => {
       stepUpInProgress = false;
       stepUpWindowId = null;
