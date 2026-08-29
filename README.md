@@ -97,12 +97,38 @@ No `tabs`, `history`, `cookies`, or `webRequest` permissions — minimal surface
 
 ## Build
 
+### Development (local testing)
+
 ```bash
 npm install
-npm run build    # tsc + copy assets to dist/
+npm run build    # tsc + esbuild + copy assets to dist/
 ```
 
 Load `dist/` as an unpacked extension in `chrome://extensions` (developer mode).
+The `dist/manifest.json` retains the `"key"` field for a stable extension ID
+across reloads.
+
+### Publication (Chrome Web Store)
+
+```bash
+npm run build:publish    # tsc + esbuild + strip "key" + zip
+```
+
+Produces:
+- `dist-publish/` — unpacked extension without the `"key"` field
+- `browserguard-vX.Y.Z.zip` — ready to upload to the Chrome Web Store
+
+The `"key"` field is required for local development (stable extension ID)
+but **rejected** by the Chrome Web Store upload validator. The publish build
+strips it automatically.
+
+**Difference:**
+
+| | `npm run build` | `npm run build:publish` |
+|---|---|---|
+| Output | `dist/` | `dist-publish/` + `.zip` |
+| `"key"` field | Present (stable dev ID) | Stripped (Web Store compliant) |
+| Use case | `chrome://extensions` unpacked | Web Store upload |
 
 ## Configuration
 

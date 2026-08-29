@@ -1,5 +1,7 @@
 node_modules/
 dist/
+dist-publish/
+*.zip
 *.log
 .DS_Store
 .env
