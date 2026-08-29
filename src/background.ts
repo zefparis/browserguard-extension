@@ -336,6 +336,8 @@ function triggerStepUp(stepUpUrl: string): void {
   stepUpSafetyTimer = setTimeout(() => {
     if (stepUpInProgress) {
       console.warn('[BrowserGuard] Step-up safety timeout — force-resetting stepUpInProgress');
+      // Notify backend so cooldown is set (prevents re-trigger loop)
+      notifyStepUpEnd(sessionId, false, 'SAFETY_TIMEOUT', 0, 0);
       stepUpInProgress = false;
       stepUpWindowId = null;
     }
@@ -369,6 +371,13 @@ function triggerStepUp(stepUpUrl: string): void {
 chrome.windows.onRemoved.addListener((windowId) => {
   if (windowId === stepUpWindowId) {
     console.info('[BrowserGuard] Step-up popup closed, windowId=', windowId);
+    // Only notify if we haven't already (handleStepUpResult or error handler
+    // may have already notified + cleared stepUpWindowId). If stepUpInProgress
+    // is still true, it means the popup was closed without a result/error —
+    // notify backend so cooldown is set.
+    if (stepUpInProgress) {
+      notifyStepUpEnd(sessionId, false, 'POPUP_CLOSED', 0, 0);
+    }
     stepUpInProgress = false;
     stepUpWindowId = null;
     if (stepUpSafetyTimer) {
@@ -377,6 +386,26 @@ chrome.windows.onRemoved.addListener((windowId) => {
     }
   }
 });
+
+// ─── Notify backend of step-up end (always, even on error/timeout) ───
+// This is critical for the cooldown mechanism: the backend sets a cooldown
+// in /step-up-result. If we only call it on success, errors/timeouts never
+// set a cooldown and the popup re-opens in an infinite loop.
+async function notifyStepUpEnd(sessionId: string, success: boolean, decision: string, score: number, confidence: number): Promise<void> {
+  try {
+    await fetch(`${BACKEND_URL.replace('/session-behavior-ping', '/step-up-result')}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Source-App': 'browserguard',
+      },
+      body: JSON.stringify({ sessionId, stepUpSuccess: success, decision, score, confidence }),
+    });
+    console.info(`[BrowserGuard] Step-up end notified to backend: success=${success} decision=${decision}`);
+  } catch (err) {
+    console.error('[BrowserGuard] Failed to notify backend of step-up end:', err);
+  }
+}
 
 // ─── Step-up result handling ────────────────────────────────────────
 
@@ -394,26 +423,7 @@ async function handleStepUpResult(result: StepUpResultMessage): Promise<void> {
   console.info('[BrowserGuard] Step-up result received:', result.decision, 'score=', result.score);
   const success = isStepUpSuccess(result);
 
-  // Notify backend of the step-up result
-  try {
-    await fetch(`${BACKEND_URL.replace('/session-behavior-ping', '/step-up-result')}`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Source-App': 'browserguard',
-      },
-      body: JSON.stringify({
-        sessionId: result.sessionId,
-        stepUpSuccess: success,
-        decision: result.decision,
-        score: result.score,
-        confidence: result.confidence,
-      }),
-    });
-    console.info('[BrowserGuard] Step-up result notified to backend, success=', success);
-  } catch (err) {
-    console.error('[BrowserGuard] Failed to notify backend of step-up result:', err);
-  }
+  await notifyStepUpEnd(result.sessionId, success, result.decision, result.score, result.confidence);
 
   stepUpInProgress = false;
   stepUpWindowId = null;
@@ -439,6 +449,9 @@ chrome.runtime.onMessage.addListener((message, _sender, _sendResponse) => {
   if (message.type === 'browserguard_stepup_error') {
     const errMsg = message as StepUpErrorMessage;
     console.error('[BrowserGuard] Step-up error:', errMsg.error, errMsg.detail);
+    // Notify backend so it sets a cooldown — otherwise the popup re-opens
+    // in an infinite loop because no cooldown is ever stored.
+    notifyStepUpEnd(errMsg.sessionId || sessionId, false, 'ERROR', 0, 0);
     stepUpInProgress = false;
     stepUpWindowId = null;
     if (stepUpSafetyTimer) {
