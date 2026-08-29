@@ -99,10 +99,31 @@ function generateSessionId(): string {
   return `bg_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 }
 
-function ensureSession(): void {
+// Promise that resolves when the initial storage restoration is complete.
+// This prevents ensureSession() from generating a new sessionId before the
+// persisted one has been loaded from chrome.storage.local (race condition
+// on MV3 service worker restarts).
+let sessionIdRestored: Promise<void>;
+
+/**
+ * Ensure a session ID exists. If the SW just restarted and sessionId is empty,
+ * wait for the storage restoration to complete before deciding whether to
+ * generate a new one. This prevents each post-restart ping from using a
+ * different sessionId, which would reset the backend reference window.
+ */
+async function ensureSession(): Promise<void> {
+  if (sessionId) return; // already have one in memory
+
+  // Wait for storage restoration to complete (fires once on SW startup)
+  await sessionIdRestored;
+
   if (!sessionId) {
+    // Storage didn't have one either — generate fresh
     sessionId = generateSessionId();
     chrome.storage.local.set({ browserguard_sessionId: sessionId });
+    console.info('[BrowserGuard] Generated new sessionId:', sessionId);
+  } else {
+    console.info('[BrowserGuard] Restored sessionId from storage:', sessionId);
   }
 }
 
@@ -166,7 +187,7 @@ async function sendBeacon(): Promise<void> {
     return;
   }
 
-  ensureSession();
+  await ensureSession();
 
   const body = {
     sessionId,
@@ -432,11 +453,19 @@ chrome.runtime.onMessage.addListener((message, _sender, _sendResponse) => {
 
 // ─── Lifecycle ──────────────────────────────────────────────────────
 
-// Restore session ID from storage on startup
-chrome.storage.local.get(['browserguard_sessionId'], (result) => {
-  if (result.browserguard_sessionId) {
-    sessionId = result.browserguard_sessionId;
-  }
+// Restore session ID from storage on startup.
+// The promise resolves when the callback fires, allowing ensureSession()
+// to wait for it before generating a new ID (fixes the race condition
+// where a post-restart ping would get a new sessionId before the
+// persisted one was loaded).
+sessionIdRestored = new Promise<void>((resolve) => {
+  chrome.storage.local.get(['browserguard_sessionId'], (result) => {
+    if (result.browserguard_sessionId) {
+      sessionId = result.browserguard_sessionId;
+      console.info('[BrowserGuard] Session ID restored from storage:', sessionId);
+    }
+    resolve();
+  });
 });
 
 // Start periodic beacon
