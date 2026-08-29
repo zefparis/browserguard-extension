@@ -7,11 +7,14 @@
     "build": "tsc --noEmit && node scripts/build.js",
     "build:publish": "tsc --noEmit && node scripts/build-publish.js",
     "dev": "node scripts/build.js --watch",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "devDependencies": {
     "@types/chrome": "^0.0.287",
     "esbuild": "^0.28.2",
-    "typescript": "^5.4.0"
+    "typescript": "^5.4.0",
+    "vitest": "^4.1.11"
   }
 }

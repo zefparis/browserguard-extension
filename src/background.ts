@@ -10,11 +10,27 @@
  * The extension is "dumb" — it captures and obeys. All threshold logic
  * (trust_score_normalized < 65) is server-side.
  *
+ * NOTE: functions are exported for unit testing (vitest). In the service
+ * worker context, the `export` keywords are stripped by esbuild (the build
+ * script bundles each entry point independently with no imports between
+ * them), so they have no runtime effect in production. The lifecycle code
+ * at the bottom (sessionIdRestored, beaconTimer, beforeunload) is guarded
+ * by `isServiceWorkerContext` so it does not execute when imported in tests.
+ *
  * @copyright (c) 2026 Benjamin BARRERE / IA SOLUTION
  * @license Patents Pending FR2514274 | FR2514546
  */
 
-export {}; // make this a module (service workers have no imports)
+// Service worker context detection: chrome.runtime is only defined in the
+// actual extension SW. In vitest, chrome.* is mocked but chrome.runtime.id
+// is not set (or set to a test sentinel). This guard prevents the lifecycle
+// code (storage restoration, beacon timer, beforeunload) from running when
+// the module is imported by tests.
+const isServiceWorkerContext =
+  typeof chrome !== 'undefined' &&
+  typeof chrome.runtime !== 'undefined' &&
+  typeof chrome.runtime.id === 'string' &&
+  chrome.runtime.id !== 'vitest-test-extension';
 
 // ─── Config ─────────────────────────────────────────────────────────
 
@@ -24,7 +40,7 @@ const STEP_UP_URL_BASE = 'https://challenge.hcs-u7.org/embed/';
 
 // ─── Types ──────────────────────────────────────────────────────────
 
-interface BehaviorSnapshot {
+export interface BehaviorSnapshot {
   keystrokeIntervals: number[];
   keystrokeHolds: number[];
   keystrokeCount: number;
@@ -42,7 +58,7 @@ interface BehaviorSnapshot {
   pixelRatio?: number;
 }
 
-interface BackendResponse {
+export interface BackendResponse {
   ok: boolean;
   divergence?: number;
   consecutiveBreaches?: number;
@@ -58,7 +74,7 @@ interface BackendResponse {
   error?: string;
 }
 
-interface StepUpResultMessage {
+export interface StepUpResultMessage {
   type: 'browserguard_stepup_result';
   decision: string;
   score: number;
@@ -70,7 +86,7 @@ interface StepUpResultMessage {
   plannedCount: number;
 }
 
-interface StepUpErrorMessage {
+export interface StepUpErrorMessage {
   type: 'browserguard_stepup_error';
   error: string;
   detail: string;
@@ -87,6 +103,13 @@ let stepUpInProgress: boolean = false;
 let stepUpWindowId: number | null = null;
 let stepUpSafetyTimer: ReturnType<typeof setTimeout> | null = null;
 let autoBeaconPaused: boolean = false;
+// Tracks whether the CURRENT session (identified by `sessionId`) has been
+// invalidated by the backend. When true, sendBeacon skips immediately (no
+// fetch) and the beacon timer is stopped — there is no point continuing to
+// ping a session that is already closed server-side. This is reset to false
+// whenever a new sessionId is generated (ensureSession) or set via test
+// helper, so a new session always starts with a clean beacon cycle.
+let sessionInvalidated: boolean = false;
 
 // Safety timeout: if no result/error is received within 90s, force-reset
 // stepUpInProgress so future beacons can trigger a new step-up.
@@ -120,6 +143,7 @@ async function ensureSession(): Promise<void> {
   if (!sessionId) {
     // Storage didn't have one either — generate fresh
     sessionId = generateSessionId();
+    sessionInvalidated = false; // new session — beacon cycle starts clean
     chrome.storage.local.set({ browserguard_sessionId: sessionId });
     console.info('[BrowserGuard] Generated new sessionId:', sessionId);
   } else {
@@ -144,7 +168,7 @@ function getDeviceContext(snap?: BehaviorSnapshot) {
 
 // ─── Build snapshot for backend ─────────────────────────────────────
 
-function buildBackendSnapshot(snap: BehaviorSnapshot) {
+export function buildBackendSnapshot(snap: BehaviorSnapshot) {
   const keystrokeIntervalStats = computeStats(snap.keystrokeIntervals);
   const keystrokeHoldStats = computeStats(snap.keystrokeHolds);
   const mouseSpeedStats = computeStats(snap.mouseSpeeds);
@@ -168,7 +192,7 @@ function buildBackendSnapshot(snap: BehaviorSnapshot) {
   };
 }
 
-function computeStats(arr: number[]): { avg: number | null; variance: number | null } {
+export function computeStats(arr: number[]): { avg: number | null; variance: number | null } {
   if (arr.length === 0) return { avg: null, variance: null };
   const avg = arr.reduce((s, v) => s + v, 0) / arr.length;
   const variance = arr.reduce((s, v) => s + (v - avg) ** 2, 0) / arr.length;
@@ -177,13 +201,23 @@ function computeStats(arr: number[]): { avg: number | null; variance: number | n
 
 // ─── Beacon to backend ──────────────────────────────────────────────
 
-async function sendBeacon(): Promise<void> {
+export async function sendBeacon(): Promise<void> {
   if (!lastSnapshot || lastSnapshot.totalEvents === 0) {
     console.debug('[BrowserGuard] Beacon skipped: no snapshot or zero events');
     return;
   }
   if (stepUpInProgress) {
     console.debug('[BrowserGuard] Beacon skipped: step-up in progress');
+    return;
+  }
+  if (sessionInvalidated) {
+    // The current session has been invalidated by the backend. There is no
+    // point continuing to beacon — the session is closed server-side. The
+    // beacon timer has already been stopped (see the invalidated handling
+    // below); this guard catches any stray beacon call (e.g. a manual
+    // triggerBeacon from the DevTools console). A new session (new sessionId
+    // via ensureSession) resets this flag and restarts the cycle.
+    console.debug('[BrowserGuard] Beacon skipped: session invalidated');
     return;
   }
 
@@ -221,6 +255,26 @@ async function sendBeacon(): Promise<void> {
       stepUpInProgress,
     }));
 
+    // ── Session invalidation: stop beaconing silently ──
+    // The backend has closed this session (behavioral divergence, mass
+    // attempts, step-up fail-closed, etc.). There is no point continuing
+    // to beacon — stop the timer and mark the session as invalidated so
+    // future sendBeacon calls skip immediately. No UI, no popup, no user-
+    // visible effect — the extension just goes quiet for this session.
+    // A new session (new sessionId via ensureSession) resets the flag and
+    // restarts the beacon cycle.
+    if (data.invalidated === true) {
+      sessionInvalidated = true;
+      if (beaconTimer) {
+        clearInterval(beaconTimer);
+        beaconTimer = null;
+      }
+      console.info('[BrowserGuard] Session invalidated by backend — beacon cycle stopped for this session');
+      // Do NOT trigger step-up even if step_up_required is also true —
+      // an invalidated session is already closed, step-up is meaningless.
+      return;
+    }
+
     // Check for step-up requirement
     if (data.step_up_required === true && data.step_up_url && !stepUpInProgress) {
       console.info('[BrowserGuard] Step-up required, triggering popup');
@@ -246,6 +300,7 @@ async function sendBeacon(): Promise<void> {
 //   browserguard.test.setSnapshot({...})     — set a fake snapshot for testing
 //   browserguard.test.resetStepUp()          — force-reset stepUpInProgress
 //   browserguard.test.state()                — dump current state
+if (isServiceWorkerContext) {
 (self as any).browserguard = {
   test: {
     triggerBeacon: () => sendBeacon(),
@@ -309,11 +364,25 @@ async function sendBeacon(): Promise<void> {
     },
   },
 };
+} // end isServiceWorkerContext guard for debug exposure
 
 // ─── Step-up trigger ────────────────────────────────────────────────
 
-function triggerStepUp(stepUpUrl: string): void {
+export function triggerStepUp(stepUpUrl: string): void {
   console.info('[BrowserGuard] triggerStepUp called, stepUpUrl=', stepUpUrl);
+
+  // Guard against duplicate popups: if a step-up is already in progress,
+  // do NOT open a second popup. The existing popup is still active (the
+  // user may be answering the challenge). Opening a second one would
+  // overwrite stepUpWindowId, losing the reference to the first window —
+  // when the first window closes, onStepUpWindowRemoved would not match
+  // (stepUpWindowId now points to the second window) and the cleanup
+  // would be silently skipped, leaving an orphan popup open.
+  if (stepUpInProgress) {
+    console.info('[BrowserGuard] Step-up already in progress, ignoring duplicate triggerStepUp call');
+    return;
+  }
+
   stepUpInProgress = true;
 
   // Build the step-up.html URL with query params
@@ -368,7 +437,7 @@ function triggerStepUp(stepUpUrl: string): void {
 // ─── Step-up popup close listener ───────────────────────────────────
 // If the popup is closed (manually, by timeout, or by crash), reset
 // stepUpInProgress so future beacons can trigger a new step-up.
-chrome.windows.onRemoved.addListener((windowId) => {
+export function onStepUpWindowRemoved(windowId: number): void {
   if (windowId === stepUpWindowId) {
     console.info('[BrowserGuard] Step-up popup closed, windowId=', windowId);
     // Only notify if we haven't already (handleStepUpResult or error handler
@@ -385,13 +454,17 @@ chrome.windows.onRemoved.addListener((windowId) => {
       stepUpSafetyTimer = null;
     }
   }
-});
+}
+
+if (isServiceWorkerContext) {
+  chrome.windows.onRemoved.addListener(onStepUpWindowRemoved);
+}
 
 // ─── Notify backend of step-up end (always, even on error/timeout) ───
 // This is critical for the cooldown mechanism: the backend sets a cooldown
 // in /step-up-result. If we only call it on success, errors/timeouts never
 // set a cooldown and the popup re-opens in an infinite loop.
-async function notifyStepUpEnd(sessionId: string, success: boolean, decision: string, score: number, confidence: number): Promise<void> {
+export async function notifyStepUpEnd(sessionId: string, success: boolean, decision: string, score: number, confidence: number): Promise<void> {
   try {
     await fetch(`${BACKEND_URL.replace('/session-behavior-ping', '/step-up-result')}`, {
       method: 'POST',
@@ -409,7 +482,7 @@ async function notifyStepUpEnd(sessionId: string, success: boolean, decision: st
 
 // ─── Step-up result handling ────────────────────────────────────────
 
-function isStepUpSuccess(result: StepUpResultMessage): boolean {
+export function isStepUpSuccess(result: StepUpResultMessage): boolean {
   // Decision logic (validated):
   //   GO → success
   //   INSUFFICIENT_CONFIDENCE + score >= 60 → success
@@ -419,11 +492,20 @@ function isStepUpSuccess(result: StepUpResultMessage): boolean {
   return false;
 }
 
-async function handleStepUpResult(result: StepUpResultMessage): Promise<void> {
+export async function handleStepUpResult(result: StepUpResultMessage): Promise<void> {
   console.info('[BrowserGuard] Step-up result received:', result.decision, 'score=', result.score);
   const success = isStepUpSuccess(result);
 
-  await notifyStepUpEnd(result.sessionId, success, result.decision, result.score, result.confidence);
+  // IMPORTANT: use the BrowserGuard sessionId (closure variable `sessionId`),
+  // NOT result.sessionId. The popup relays currentSession.sessionId from the
+  // GateGuard embed iframe (embed.js:351), which is the GateGuard-internal
+  // session ID returned by /session/start — a different identifier than the
+  // BrowserGuard behavioral session ID used for Redis keys, beacons, and
+  // cooldown. Using result.sessionId here would write the cooldown and the
+  // emaDivergence reset under an orphan Redis key (browserguard:behavior:session:<gg_...>)
+  // that the beacons never read, making the cooldown and the state repair
+  // completely inoperative (re-trigger loop on every ping, even after a GO).
+  await notifyStepUpEnd(sessionId, success, result.decision, result.score, result.confidence);
 
   stepUpInProgress = false;
   stepUpWindowId = null;
@@ -435,7 +517,7 @@ async function handleStepUpResult(result: StepUpResultMessage): Promise<void> {
 
 // ─── Message listener ───────────────────────────────────────────────
 
-chrome.runtime.onMessage.addListener((message, _sender, _sendResponse) => {
+export function onRuntimeMessage(message: any, _sender: any, _sendResponse: any): boolean {
   if (message.type === 'browserguard_behavior_snapshot') {
     lastSnapshot = message.snapshot as BehaviorSnapshot;
     return false; // synchronous, no response needed
@@ -451,7 +533,11 @@ chrome.runtime.onMessage.addListener((message, _sender, _sendResponse) => {
     console.error('[BrowserGuard] Step-up error:', errMsg.error, errMsg.detail);
     // Notify backend so it sets a cooldown — otherwise the popup re-opens
     // in an infinite loop because no cooldown is ever stored.
-    notifyStepUpEnd(errMsg.sessionId || sessionId, false, 'ERROR', 0, 0);
+    // Use the BrowserGuard sessionId (closure variable), NOT errMsg.sessionId
+    // (which comes from GateGuard's embed.js:408 and is the GateGuard-internal
+    // session ID, not the BrowserGuard behavioral session ID). See
+    // handleStepUpResult above for the full rationale.
+    notifyStepUpEnd(sessionId, false, 'ERROR', 0, 0);
     stepUpInProgress = false;
     stepUpWindowId = null;
     if (stepUpSafetyTimer) {
@@ -462,7 +548,46 @@ chrome.runtime.onMessage.addListener((message, _sender, _sendResponse) => {
   }
 
   return false;
-});
+}
+
+if (isServiceWorkerContext) {
+  chrome.runtime.onMessage.addListener(onRuntimeMessage);
+}
+
+// ─── Test helpers (exported, no runtime effect in production SW) ────
+// These let tests inspect and mutate the module-level state that the
+// service worker functions operate on. In production, esbuild strips the
+// `export` keywords (each entry point is bundled independently), so these
+// are not accessible from other entry points.
+export function __testGetState() {
+  return {
+    sessionId,
+    stepUpInProgress,
+    stepUpWindowId,
+    hasSnapshot: !!lastSnapshot,
+    snapshotEvents: lastSnapshot?.totalEvents ?? 0,
+    autoBeaconPaused,
+    sessionInvalidated,
+  };
+}
+
+export function __testSetSessionId(id: string): void {
+  sessionId = id;
+  // Reset invalidation flag when session changes — a new session starts
+  // with a clean beacon cycle, mirroring ensureSession() behavior.
+  sessionInvalidated = false;
+}
+
+export function __testSetSnapshot(snap: BehaviorSnapshot | null): void {
+  lastSnapshot = snap;
+}
+
+export function __testResetStepUp(): void {
+  stepUpInProgress = false;
+  stepUpWindowId = null;
+  sessionInvalidated = false;
+  if (stepUpSafetyTimer) { clearTimeout(stepUpSafetyTimer); stepUpSafetyTimer = null; }
+}
 
 // ─── Lifecycle ──────────────────────────────────────────────────────
 
@@ -471,22 +596,28 @@ chrome.runtime.onMessage.addListener((message, _sender, _sendResponse) => {
 // to wait for it before generating a new ID (fixes the race condition
 // where a post-restart ping would get a new sessionId before the
 // persisted one was loaded).
-sessionIdRestored = new Promise<void>((resolve) => {
-  chrome.storage.local.get(['browserguard_sessionId'], (result) => {
-    if (result.browserguard_sessionId) {
-      sessionId = result.browserguard_sessionId;
-      console.info('[BrowserGuard] Session ID restored from storage:', sessionId);
-    }
-    resolve();
+if (isServiceWorkerContext) {
+  sessionIdRestored = new Promise<void>((resolve) => {
+    chrome.storage.local.get(['browserguard_sessionId'], (result) => {
+      if (result.browserguard_sessionId) {
+        sessionId = result.browserguard_sessionId;
+        console.info('[BrowserGuard] Session ID restored from storage:', sessionId);
+      }
+      resolve();
+    });
   });
-});
 
-// Start periodic beacon
-beaconTimer = setInterval(sendBeacon, BEACON_INTERVAL_MS);
+  // Start periodic beacon
+  beaconTimer = setInterval(sendBeacon, BEACON_INTERVAL_MS);
 
-// Clean up on suspend (MV3 service workers can be killed)
-self.addEventListener('beforeunload', () => {
-  console.info('[BrowserGuard] Service worker suspending — state will be lost');
-  if (beaconTimer) clearInterval(beaconTimer);
-  if (stepUpSafetyTimer) clearTimeout(stepUpSafetyTimer);
-});
+  // Clean up on suspend (MV3 service workers can be killed)
+  self.addEventListener('beforeunload', () => {
+    console.info('[BrowserGuard] Service worker suspending — state will be lost');
+    if (beaconTimer) clearInterval(beaconTimer);
+    if (stepUpSafetyTimer) clearTimeout(stepUpSafetyTimer);
+  });
+} else {
+  // In tests (or any non-SW context), resolve immediately so ensureSession()
+  // doesn't hang waiting for a storage callback that will never fire.
+  sessionIdRestored = Promise.resolve();
+}
