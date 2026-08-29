@@ -86,6 +86,7 @@ let beaconTimer: ReturnType<typeof setInterval> | null = null;
 let stepUpInProgress: boolean = false;
 let stepUpWindowId: number | null = null;
 let stepUpSafetyTimer: ReturnType<typeof setTimeout> | null = null;
+let autoBeaconPaused: boolean = false;
 
 // Safety timeout: if no result/error is received within 90s, force-reset
 // stepUpInProgress so future beacons can trigger a new step-up.
@@ -268,7 +269,23 @@ async function sendBeacon(): Promise<void> {
       stepUpWindowId,
       hasSnapshot: !!lastSnapshot,
       snapshotEvents: lastSnapshot?.totalEvents ?? 0,
+      autoBeaconPaused,
     }),
+    pauseAutoBeacon: () => {
+      if (beaconTimer) {
+        clearInterval(beaconTimer);
+        beaconTimer = null;
+      }
+      autoBeaconPaused = true;
+      console.info('[BrowserGuard] Auto beacon paused — manual testing mode active');
+    },
+    resumeAutoBeacon: () => {
+      if (!beaconTimer) {
+        beaconTimer = setInterval(sendBeacon, BEACON_INTERVAL_MS);
+      }
+      autoBeaconPaused = false;
+      console.info('[BrowserGuard] Auto beacon resumed');
+    },
   },
 };
 
