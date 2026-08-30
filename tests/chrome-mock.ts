@@ -65,6 +65,10 @@ const windows = {
   create: ((opts: any, callback?: (w: MockWindow) => void) => {
     // Default no-op; tests call setupWindowsCreate() to configure
   }) as any,
+  getLastFocused: ((callback?: (w: { left: number; top: number; width: number; height: number }) => void) => {
+    // Default: simulate a 1920x1080 window at (0,0)
+    if (callback) callback({ left: 0, top: 0, width: 1920, height: 1080 });
+  }) as any,
 };
 
 // ─── chrome.storage.local ───────────────────────────────────────────

@@ -412,25 +412,42 @@ export function triggerStepUp(stepUpUrl: string): void {
     }
   }, STEP_UP_SAFETY_TIMEOUT_MS);
 
-  // Open as a popup window — zero friction, auto-closes after result
-  chrome.windows.create({
-    url: fullUrl,
-    type: 'popup',
-    width: 480,
-    height: 400,
-    focused: true,
-  }, (window) => {
-    if (chrome.runtime.lastError) {
-      console.error('[BrowserGuard] Failed to open step-up window:', chrome.runtime.lastError);
-      stepUpInProgress = false;
-      stepUpWindowId = null;
-      if (stepUpSafetyTimer) clearTimeout(stepUpSafetyTimer);
-      return;
-    }
-    if (window) {
-      stepUpWindowId = window.id ?? null;
-      console.info('[BrowserGuard] Step-up popup opened, windowId=', window.id);
-    }
+  // Open as a popup window — zero friction, auto-closes after result.
+  // Center the popup over the user's last-focused window so it's immediately
+  // visible (critical for the 0.7s digit display in stroop_digitspan_combo).
+  const popupWidth = 480;
+  const popupHeight = 400;
+
+  chrome.windows.getLastFocused((currentWindow) => {
+    const winLeft = currentWindow?.left ?? 0;
+    const winTop = currentWindow?.top ?? 0;
+    const winWidth = currentWindow?.width ?? popupWidth;
+    const winHeight = currentWindow?.height ?? popupHeight;
+
+    const left = Math.round(winLeft + (winWidth - popupWidth) / 2);
+    const top = Math.round(winTop + (winHeight - popupHeight) / 2);
+
+    chrome.windows.create({
+      url: fullUrl,
+      type: 'popup',
+      width: popupWidth,
+      height: popupHeight,
+      left,
+      top,
+      focused: true,
+    }, (window) => {
+      if (chrome.runtime.lastError) {
+        console.error('[BrowserGuard] Failed to open step-up window:', chrome.runtime.lastError);
+        stepUpInProgress = false;
+        stepUpWindowId = null;
+        if (stepUpSafetyTimer) clearTimeout(stepUpSafetyTimer);
+        return;
+      }
+      if (window) {
+        stepUpWindowId = window.id ?? null;
+        console.info('[BrowserGuard] Step-up popup opened, windowId=', window.id);
+      }
+    });
   });
 }
 
