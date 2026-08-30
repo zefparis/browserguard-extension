@@ -89,7 +89,6 @@ Part of the HCS-U7 ecosystem. Routes traffic through the Cloudflare Worker `hcs-
 | Permission | Justification |
 |-----------|---------------|
 | `storage` | Persist session ID across service worker restarts (MV3 kills SWs) |
-| `activeTab` | Access the current tab for behavioral context (no broad tab access) |
 | `host_permissions: https://api.hcs-u7.org/hv/*` | Beacon to backend through the Worker proxy |
 
 No `tabs`, `history`, `cookies`, or `webRequest` permissions — minimal surface.
