@@ -96,9 +96,49 @@ const zipPath = join(root, zipName);
 // Remove old zip if exists
 if (existsSync(zipPath)) rmSync(zipPath);
 
-// Create zip from inside dist-publish/ so paths are relative
+// Create zip from inside dist-publish/ so paths are relative (manifest.json at root)
 execSync(`cd "${distPublish}" && zip -r "${zipPath}" .`, { stdio: 'pipe' });
 console.log(`[build:publish] Created ${zipName} (${zipPath})`);
+
+// ── Post-zip verification ──────────────────────────────────────────────
+// Guard against regressions that caused Chrome Web Store rejections in the
+// past: forbidden permissions, source files leaking into the package, or
+// manifest.json not being at the archive root.
+const zipListing = execSync(`unzip -l "${zipPath}"`, { encoding: 'utf8' });
+const zipFiles = zipListing.split('\n').map(l => l.trim()).filter(Boolean);
+
+// Check 1: manifest.json at root (unzip -l format: "Length  Date  Time  Name")
+const hasManifestAtRoot = zipFiles.some(l => /\s+manifest\.json\s*$/.test(l) && !/src\/manifest\.json/.test(l));
+if (!hasManifestAtRoot) {
+  console.error('[build:publish] FATAL: manifest.json not found at zip root!');
+  console.error(zipListing);
+  process.exit(1);
+}
+
+// Check 2: no source files, node_modules, or .git
+const forbiddenPatterns = [/\.ts$/, /node_modules/, /\.git/, /package\.json/, /package-lock/, /tsconfig/, /vitest/, /scripts\//];
+const leaked = zipFiles.filter(l =>
+  forbiddenPatterns.some(p => p.test(l)) && !/Name$/.test(l) && !/^---/.test(l) && !/^Length/.test(l) && !/^files$/.test(l),
+);
+if (leaked.length > 0) {
+  console.error('[build:publish] FATAL: forbidden files leaked into zip:');
+  leaked.forEach(f => console.error(`  ${f}`));
+  process.exit(1);
+}
+
+// Check 3: no forbidden permissions (regression guard for scripting/activeTab)
+const FORBIDDEN_PERMISSIONS = ['scripting', 'activeTab'];
+const manifestInZip = execSync(`unzip -p "${zipPath}" manifest.json`, { encoding: 'utf8' });
+const manifestJson = JSON.parse(manifestInZip);
+const declaredPerms = manifestJson.permissions || [];
+const forbiddenFound = FORBIDDEN_PERMISSIONS.filter(p => declaredPerms.includes(p));
+if (forbiddenFound.length > 0) {
+  console.error(`[build:publish] FATAL: forbidden permissions in manifest: ${forbiddenFound.join(', ')}`);
+  console.error('These permissions were removed for Chrome Web Store compliance and must not return.');
+  process.exit(1);
+}
+
+console.log('[build:publish] Post-zip checks passed (manifest at root, no source leaks, no forbidden permissions)');
 
 // ── Summary ──
 console.log('');

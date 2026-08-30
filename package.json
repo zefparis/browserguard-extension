@@ -6,6 +6,7 @@
   "scripts": {
     "build": "tsc --noEmit && node scripts/build.js",
     "build:publish": "tsc --noEmit && node scripts/build-publish.js",
+    "package": "npm run build:publish",
     "dev": "node scripts/build.js --watch",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
