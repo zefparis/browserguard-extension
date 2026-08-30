@@ -96,6 +96,7 @@ export interface StepUpErrorMessage {
 // ─── State ──────────────────────────────────────────────────────────
 
 let sessionId: string = '';
+let installId: string = '';
 let tenantId: string = 'browserguard-default';
 let lastSnapshot: BehaviorSnapshot | null = null;
 let beaconTimer: ReturnType<typeof setInterval> | null = null;
@@ -120,6 +121,10 @@ const STEP_UP_SAFETY_TIMEOUT_MS = 90_000;
 
 function generateSessionId(): string {
   return `bg_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function generateInstallId(): string {
+  return `bg_install_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 }
 
 // Promise that resolves when the initial storage restoration is complete.
@@ -148,6 +153,37 @@ async function ensureSession(): Promise<void> {
     console.info('[BrowserGuard] Generated new sessionId:', sessionId);
   } else {
     console.info('[BrowserGuard] Restored sessionId from storage:', sessionId);
+  }
+}
+
+// ─── Install ID (persistent across sessions, survives SW restarts) ──
+// Unlike sessionId (regenerated per navigation session), installId is
+// generated once and never regenerated as long as the extension remains
+// installed with its data. It survives browser restarts and SW kills.
+// Only a full uninstall or manual data clearing removes it.
+
+let installIdRestored: Promise<void>;
+
+/**
+ * Ensure an install ID exists. If the SW just restarted and installId is
+ * empty, wait for the storage restoration to complete before deciding
+ * whether to generate a new one. This ID is NEVER reset — it is only
+ * generated once (first install) and restored on every subsequent SW
+ * startup.
+ */
+async function ensureInstallId(): Promise<void> {
+  if (installId) return; // already have one in memory
+
+  // Wait for storage restoration to complete (fires once on SW startup)
+  await installIdRestored;
+
+  if (!installId) {
+    // First install — generate and persist
+    installId = generateInstallId();
+    chrome.storage.local.set({ browserguard_installId: installId });
+    console.info('[BrowserGuard] Generated new installId:', installId);
+  } else {
+    console.info('[BrowserGuard] Restored installId from storage:', installId);
   }
 }
 
@@ -222,9 +258,11 @@ export async function sendBeacon(): Promise<void> {
   }
 
   await ensureSession();
+  await ensureInstallId();
 
   const body = {
     sessionId,
+    installId,
     source: 'browserguard' as const,
     snapshot: buildBackendSnapshot(lastSnapshot),
     deviceContext: getDeviceContext(lastSnapshot),
@@ -482,6 +520,11 @@ if (isServiceWorkerContext) {
 // in /step-up-result. If we only call it on success, errors/timeouts never
 // set a cooldown and the popup re-opens in an infinite loop.
 export async function notifyStepUpEnd(sessionId: string, success: boolean, decision: string, score: number, confidence: number): Promise<void> {
+  // Note: we do NOT await ensureInstallId() here — notifyStepUpEnd is called
+  // fire-and-forget from several places (safety timer, window removed, error
+  // handler). If installId isn't set yet, we send it as undefined (the backend
+  // schema marks it optional). sendBeacon ensures installId is populated on
+  // the next 5s cycle, and subsequent step-up results will include it.
   try {
     await fetch(`${BACKEND_URL.replace('/session-behavior-ping', '/step-up-result')}`, {
       method: 'POST',
@@ -489,7 +532,7 @@ export async function notifyStepUpEnd(sessionId: string, success: boolean, decis
         'Content-Type': 'application/json',
         'X-Source-App': 'browserguard',
       },
-      body: JSON.stringify({ sessionId, stepUpSuccess: success, decision, score, confidence }),
+      body: JSON.stringify({ sessionId, stepUpSuccess: success, decision, score, confidence, installId: installId || undefined }),
     });
     console.info(`[BrowserGuard] Step-up end notified to backend: success=${success} decision=${decision}`);
   } catch (err) {
@@ -579,6 +622,7 @@ if (isServiceWorkerContext) {
 export function __testGetState() {
   return {
     sessionId,
+    installId,
     stepUpInProgress,
     stepUpWindowId,
     hasSnapshot: !!lastSnapshot,
@@ -593,6 +637,10 @@ export function __testSetSessionId(id: string): void {
   // Reset invalidation flag when session changes — a new session starts
   // with a clean beacon cycle, mirroring ensureSession() behavior.
   sessionInvalidated = false;
+}
+
+export function __testSetInstallId(id: string): void {
+  installId = id;
 }
 
 export function __testSetSnapshot(snap: BehaviorSnapshot | null): void {
@@ -624,6 +672,18 @@ if (isServiceWorkerContext) {
     });
   });
 
+  // Restore installId from storage on startup (parallel to sessionId).
+  // This is a one-time read — installId is never regenerated once set.
+  installIdRestored = new Promise<void>((resolve) => {
+    chrome.storage.local.get(['browserguard_installId'], (result) => {
+      if (result.browserguard_installId) {
+        installId = result.browserguard_installId;
+        console.info('[BrowserGuard] Install ID restored from storage:', installId);
+      }
+      resolve();
+    });
+  });
+
   // Start periodic beacon
   beaconTimer = setInterval(sendBeacon, BEACON_INTERVAL_MS);
 
@@ -635,6 +695,8 @@ if (isServiceWorkerContext) {
   });
 } else {
   // In tests (or any non-SW context), resolve immediately so ensureSession()
-  // doesn't hang waiting for a storage callback that will never fire.
+  // and ensureInstallId() don't hang waiting for a storage callback that
+  // will never fire.
   sessionIdRestored = Promise.resolve();
+  installIdRestored = Promise.resolve();
 }
