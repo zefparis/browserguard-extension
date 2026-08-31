@@ -52,6 +52,9 @@ const runtime = {
   lastError: undefined as chrome.runtime.LastError | undefined,
   getURL: (path: string): string => `chrome-extension://test-id/${path}`,
   onMessage: new MockEvent<[any, any, any]>(),
+  // getManifest — used by sendBeacon to include extVersion in the ping
+  // payload (adoption tracking for the Worker-proxied step-up rollout).
+  getManifest: (): { version: string } => ({ version: '0.2.0-test' }),
 };
 
 // ─── chrome.windows ─────────────────────────────────────────────────

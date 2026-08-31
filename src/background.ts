@@ -266,6 +266,11 @@ export async function sendBeacon(): Promise<void> {
     source: 'browserguard' as const,
     snapshot: buildBackendSnapshot(lastSnapshot),
     deviceContext: getDeviceContext(lastSnapshot),
+    // Extension version for adoption tracking. The backend logs this in
+    // the browserguard_risk_eval structured log to measure the share of
+    // v0.2.0+ extensions (CSP frame-src includes api.hcs-u7.org) before
+    // flipping BROWSERGUARD_STEP_UP_URL to the Worker-proxied URL.
+    extVersion: chrome.runtime.getManifest().version,
   };
 
   try {
