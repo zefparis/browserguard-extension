@@ -117,6 +117,56 @@ let sessionInvalidated: boolean = false;
 // 90s > 60s (step-up.ts timeout) to let the normal close flow happen first.
 const STEP_UP_SAFETY_TIMEOUT_MS = 90_000;
 
+// ─── Step-up state persistence (R7a/R7b/R7c fix) ────────────────────
+// MV3 service workers are killed and restarted by Chrome at any time.
+// stepUpInProgress, stepUpWindowId, and the 90s safety timer are all
+// in-memory and lost on restart. This causes:
+//   R7a — orphan popup: onStepUpWindowRemoved won't match (windowId=null)
+//   R7b — double step-up: stepUpInProgress=false → second popup opened
+//   R7c — safety timer lost: no force-reset if popup hangs
+//
+// Fix: persist step-up state to chrome.storage.local so it survives SW
+// restarts. On startup, restore and reconcile (check if popup still
+// exists, re-arm safety timer with remaining time, or clean up if the
+// popup was closed while the SW was dead).
+
+interface StepUpState {
+  inProgress: boolean;
+  windowId: number | null;
+  startedAt: number | null;
+  sessionId: string | null;
+}
+
+const STEP_UP_STATE_KEY = 'browserguard_stepUpState';
+
+function clearStepUpState(): void {
+  stepUpInProgress = false;
+  stepUpWindowId = null;
+  if (stepUpSafetyTimer) {
+    clearTimeout(stepUpSafetyTimer);
+    stepUpSafetyTimer = null;
+  }
+  if (isServiceWorkerContext) {
+    chrome.storage.local.remove(STEP_UP_STATE_KEY);
+  }
+}
+
+function persistStepUpState(): void {
+  if (!isServiceWorkerContext) return;
+  const state: StepUpState = {
+    inProgress: stepUpInProgress,
+    windowId: stepUpWindowId,
+    startedAt: stepUpSafetyTimer ? Date.now() : null,
+    sessionId: stepUpInProgress ? sessionId : null,
+  };
+  chrome.storage.local.set({ [STEP_UP_STATE_KEY]: state });
+}
+
+// Promise that resolves when step-up state restoration is complete on
+// SW startup. sendBeacon() awaits this before checking stepUpInProgress
+// to avoid evaluating the guard with stale (false) state.
+let stepUpStateRestored: Promise<void>;
+
 // ─── Session ID generation ──────────────────────────────────────────
 
 function generateSessionId(): string {
@@ -242,6 +292,10 @@ export async function sendBeacon(): Promise<void> {
     console.debug('[BrowserGuard] Beacon skipped: no snapshot or zero events');
     return;
   }
+  // Wait for step-up state restoration before checking stepUpInProgress.
+  // Without this, a post-restart beacon could see stepUpInProgress=false
+  // (stale) and open a duplicate popup while the original is still open (R7b).
+  await stepUpStateRestored;
   if (stepUpInProgress) {
     console.debug('[BrowserGuard] Beacon skipped: step-up in progress');
     return;
@@ -377,9 +431,7 @@ if (isServiceWorkerContext) {
       });
     },
     resetStepUp: () => {
-      stepUpInProgress = false;
-      stepUpWindowId = null;
-      if (stepUpSafetyTimer) { clearTimeout(stepUpSafetyTimer); stepUpSafetyTimer = null; }
+      clearStepUpState();
       console.info('[BrowserGuard] stepUpInProgress force-reset');
     },
     state: () => ({
@@ -450,10 +502,12 @@ export function triggerStepUp(stepUpUrl: string): void {
       console.warn('[BrowserGuard] Step-up safety timeout — force-resetting stepUpInProgress');
       // Notify backend so cooldown is set (prevents re-trigger loop)
       notifyStepUpEnd(sessionId, false, 'SAFETY_TIMEOUT', 0, 0);
-      stepUpInProgress = false;
-      stepUpWindowId = null;
+      clearStepUpState();
     }
   }, STEP_UP_SAFETY_TIMEOUT_MS);
+
+  // Persist state so it survives SW restart (R7a/R7b/R7c fix)
+  persistStepUpState();
 
   // Open as a popup window — zero friction, auto-closes after result.
   // Center the popup over the user's last-focused window so it's immediately
@@ -481,14 +535,14 @@ export function triggerStepUp(stepUpUrl: string): void {
     }, (window) => {
       if (chrome.runtime.lastError) {
         console.error('[BrowserGuard] Failed to open step-up window:', chrome.runtime.lastError);
-        stepUpInProgress = false;
-        stepUpWindowId = null;
-        if (stepUpSafetyTimer) clearTimeout(stepUpSafetyTimer);
+        clearStepUpState();
         return;
       }
       if (window) {
         stepUpWindowId = window.id ?? null;
         console.info('[BrowserGuard] Step-up popup opened, windowId=', window.id);
+        // Persist the windowId now that we have it
+        persistStepUpState();
       }
     });
   });
@@ -507,12 +561,7 @@ export function onStepUpWindowRemoved(windowId: number): void {
     if (stepUpInProgress) {
       notifyStepUpEnd(sessionId, false, 'POPUP_CLOSED', 0, 0);
     }
-    stepUpInProgress = false;
-    stepUpWindowId = null;
-    if (stepUpSafetyTimer) {
-      clearTimeout(stepUpSafetyTimer);
-      stepUpSafetyTimer = null;
-    }
+    clearStepUpState();
   }
 }
 
@@ -572,12 +621,7 @@ export async function handleStepUpResult(result: StepUpResultMessage): Promise<v
   // completely inoperative (re-trigger loop on every ping, even after a GO).
   await notifyStepUpEnd(sessionId, success, result.decision, result.score, result.confidence);
 
-  stepUpInProgress = false;
-  stepUpWindowId = null;
-  if (stepUpSafetyTimer) {
-    clearTimeout(stepUpSafetyTimer);
-    stepUpSafetyTimer = null;
-  }
+  clearStepUpState();
 }
 
 // ─── Message listener ───────────────────────────────────────────────
@@ -603,12 +647,7 @@ export function onRuntimeMessage(message: any, _sender: any, _sendResponse: any)
     // session ID, not the BrowserGuard behavioral session ID). See
     // handleStepUpResult above for the full rationale.
     notifyStepUpEnd(sessionId, false, 'ERROR', 0, 0);
-    stepUpInProgress = false;
-    stepUpWindowId = null;
-    if (stepUpSafetyTimer) {
-      clearTimeout(stepUpSafetyTimer);
-      stepUpSafetyTimer = null;
-    }
+    clearStepUpState();
     return false;
   }
 
@@ -653,10 +692,8 @@ export function __testSetSnapshot(snap: BehaviorSnapshot | null): void {
 }
 
 export function __testResetStepUp(): void {
-  stepUpInProgress = false;
-  stepUpWindowId = null;
+  clearStepUpState();
   sessionInvalidated = false;
-  if (stepUpSafetyTimer) { clearTimeout(stepUpSafetyTimer); stepUpSafetyTimer = null; }
 }
 
 // ─── Lifecycle ──────────────────────────────────────────────────────
@@ -689,6 +726,82 @@ if (isServiceWorkerContext) {
     });
   });
 
+  // ── Step-up state restoration (R7a/R7b/R7c fix) ──────────────────
+  // On SW restart, if a step-up was in progress when the SW was killed,
+  // reconcile the persisted state:
+  //   - If the 90s safety window has elapsed → treat as timeout, notify
+  //     backend, clear state.
+  //   - If the popup window no longer exists → the popup was closed while
+  //     the SW was dead. Notify backend (POPUP_CLOSED), clear state.
+  //   - If the popup still exists → restore windowId, re-arm the safety
+  //     timer with the remaining time. The chrome.windows.onRemoved
+  //     listener (registered above at line ~573) will handle normal close.
+  //
+  // This Promise MUST resolve before sendBeacon checks stepUpInProgress,
+  // otherwise a post-restart beacon could open a duplicate popup (R7b).
+  stepUpStateRestored = new Promise<void>((resolve) => {
+    chrome.storage.local.get([STEP_UP_STATE_KEY], (result) => {
+      const saved = result[STEP_UP_STATE_KEY] as StepUpState | undefined;
+      if (!saved || !saved.inProgress) {
+        // No step-up was in progress — clean state
+        if (saved) chrome.storage.local.remove(STEP_UP_STATE_KEY);
+        resolve();
+        return;
+      }
+
+      const elapsed = Date.now() - (saved.startedAt ?? 0);
+      const remaining = STEP_UP_SAFETY_TIMEOUT_MS - elapsed;
+
+      if (remaining <= 0) {
+        // Safety timeout already elapsed while SW was dead — treat as timeout
+        console.warn('[BrowserGuard] Step-up safety timeout elapsed during SW downtime — notifying backend');
+        // Use saved.sessionId if our closure sessionId isn't set yet
+        const sid = sessionId || saved.sessionId || '';
+        notifyStepUpEnd(sid, false, 'SAFETY_TIMEOUT_AFTER_RESTART', 0, 0);
+        clearStepUpState();
+        resolve();
+        return;
+      }
+
+      // Check if the popup window still exists
+      if (saved.windowId !== null) {
+        chrome.windows.get(saved.windowId, (win) => {
+          if (chrome.runtime.lastError || !win) {
+            // Window no longer exists — popup was closed while SW was dead
+            console.warn('[BrowserGuard] Step-up popup closed during SW downtime — notifying backend, windowId=', saved.windowId);
+            const sid = sessionId || saved.sessionId || '';
+            notifyStepUpEnd(sid, false, 'POPUP_CLOSED_DURING_RESTART', 0, 0);
+            clearStepUpState();
+            resolve();
+          } else {
+            // Popup still exists — restore state and re-arm safety timer
+            console.info('[BrowserGuard] Step-up popup still open after SW restart — restoring state, windowId=', saved.windowId, 'remaining=', remaining, 'ms');
+            stepUpInProgress = true;
+            stepUpWindowId = saved.windowId;
+            stepUpSafetyTimer = setTimeout(() => {
+              if (stepUpInProgress) {
+                console.warn('[BrowserGuard] Step-up safety timeout (post-restart) — force-resetting');
+                notifyStepUpEnd(sessionId, false, 'SAFETY_TIMEOUT', 0, 0);
+                clearStepUpState();
+              }
+            }, remaining);
+            // Persist updated startedAt so future restarts calculate correctly
+            persistStepUpState();
+            resolve();
+          }
+        });
+      } else {
+        // inProgress was true but windowId was null — the popup hadn't
+        // opened yet when the SW was killed. Treat as failed trigger.
+        console.warn('[BrowserGuard] Step-up was in progress but no windowId — treating as failed trigger');
+        const sid = sessionId || saved.sessionId || '';
+        notifyStepUpEnd(sid, false, 'POPUP_CLOSED_DURING_RESTART', 0, 0);
+        clearStepUpState();
+        resolve();
+      }
+    });
+  });
+
   // Start periodic beacon
   beaconTimer = setInterval(sendBeacon, BEACON_INTERVAL_MS);
 
@@ -704,4 +817,5 @@ if (isServiceWorkerContext) {
   // will never fire.
   sessionIdRestored = Promise.resolve();
   installIdRestored = Promise.resolve();
+  stepUpStateRestored = Promise.resolve();
 }
