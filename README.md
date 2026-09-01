@@ -170,6 +170,67 @@ The alarm is **not cleared** on `beforeunload` (SW suspend) — it is designed t
 survive and wake the SW. It is cleared only when the session is invalidated by
 the backend or when the beacon is paused via the debug API.
 
+## Limitation connue — snapshot multi-onglet
+
+### Comportement actuel
+
+Le service worker stocke le snapshot comportemental dans une variable
+module unique `lastSnapshot` (pas une Map par onglet). Chaque content script
+(une instance par onglet/page) envoie son snapshot au SW via
+`chrome.runtime.sendMessage` toutes les 5s. Le dernier message reçu écrase
+`lastSnapshot`, indépendamment de l'onglet d'où il provient.
+
+Si l'utilisateur a plusieurs onglets actifs simultanément avec interaction
+dans plus d'un onglet dans la même fenêtre de 5s, le beacon suivant envoie
+le snapshot du dernier flush reçu — pas nécessairement celui de l'onglet
+actif.
+
+### Pourquoi ce n'est pas corrigé
+
+L'impact sur le scoring est **négligeable** :
+
+- Le snapshot « mixte » n'est pas du bruit aléatoire — c'est le comportement
+  du **même utilisateur** dans un autre onglet.
+- Les features comportementales (vitesse souris, intervalles clavier,
+  courbature) sont caractéristiques de l'utilisateur, pas de la page.
+- La divergence EMA entre onglets d'un même utilisateur est faible comparée
+  à la divergence humain vs bot que le scoring cherche à détecter.
+- Le cas problématique (onglet inactif écrase l'actif) est rare : il nécessite
+  que l'utilisateur switch d'onglet pendant la fenêtre de 5s ET que le flush
+  de l'onglet inactif arrive après celui de l'onglet actif.
+
+Avec 4 installs de test et un engineering capacity limité, le ROI d'un fix
+n'est pas démontré.
+
+### Ce qui déclencherait une réévaluation
+
+Si les logs `browserguard_risk_eval` (côté `hybrid-vector-api`) montrent une
+**corrélation** entre faux positifs de step-up et usage multi-onglet actif
+(pas mesuré aujourd'hui, faute de volume), la limitation devra être
+réévaluée.
+
+### Option de secours si besoin plus tard
+
+L'approche recommandée si le problème devient mesurable :
+
+1. **Ajouter `visibilityState` au message du content script** —
+   `document.visibilityState` est une API web standard, pas une permission
+   Chrome. Le content script inclut déjà `url` dans le message ; ajouter
+   `visibilityState: document.visibilityState` est trivial.
+2. **Filtrer côté SW** — stocker les snapshots dans une `Map<tabId, snapshot>`
+   (via `sender.tab.id`, disponible sans permission `tabs`), et au moment du
+   beacon, n'envoyer que le snapshot avec `visibilityState === 'visible'`.
+   Si aucun n'est visible (tous les onglets en arrière-plan), fallback vers
+   le dernier reçu (comportement actuel).
+3. **Pas de nouvelle permission Chrome requise** — `sender.tab.id` est
+   disponible dans `chrome.runtime.onMessage` sans permission `tabs`, et
+   `document.visibilityState` est une API web standard.
+
+**Ne PAS scoper la session par onglet** (sessionId par onglet, état de
+référence par onglet côté serveur) — le coût serveur et la complexité du
+step-up multi-onglet (quel onglet reçoit le popup ?) sont disproportionnés
+par rapport au bénéfice.
+
 ## Related Repos
 
 - **hybrid-vector-api** — backend route `/api/browserguard/session-behavior-ping`

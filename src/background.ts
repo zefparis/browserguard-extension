@@ -144,6 +144,11 @@ export interface StepUpErrorMessage {
 let sessionId: string = '';
 let installId: string = '';
 let tenantId: string = 'browserguard-default';
+// ⚠ LIMITATION: lastSnapshot est une variable unique, écrasée par le dernier
+// message reçu de n'importe quel onglet. En usage multi-onglet actif simultané,
+// le beacon peut envoyer le snapshot d'un onglet inactif au lieu de l'actif.
+// Non corrigé — l'impact sur le scoring est négligeable (données du même
+// utilisateur). Voir README.md → "Limitation connue — snapshot multi-onglet".
 let lastSnapshot: BehaviorSnapshot | null = null;
 let beaconTimer: ReturnType<typeof setInterval> | null = null;
 let stepUpInProgress: boolean = false;
@@ -725,9 +730,15 @@ export async function handleStepUpResult(result: StepUpResultMessage): Promise<v
 }
 
 // ─── Message listener ───────────────────────────────────────────────
+// Note: les snapshots multi-onglet s'écrasent mutuellement dans lastSnapshot
+// (pas de Map par tabId). Voir README.md → "Limitation connue — snapshot
+// multi-onglet" pour le contexte et l'option de secours si besoin.
 
 export function onRuntimeMessage(message: any, _sender: any, _sendResponse: any): boolean {
   if (message.type === 'browserguard_behavior_snapshot') {
+    // Le dernier onglet à flusher écrase les données des autres. _sender
+    // (qui contient sender.tab.id) est intentionnellement ignoré pour
+    // l'instant — voir la limitation documentée ci-dessus.
     lastSnapshot = message.snapshot as BehaviorSnapshot;
     return false; // synchronous, no response needed
   }
