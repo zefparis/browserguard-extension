@@ -71,6 +71,9 @@ export interface BackendResponse {
   trust_scope?: string | null;
   step_up_required?: boolean;
   step_up_url?: string | null;
+  // Experimental observability (Phase 1) — not consumed by the extension.
+  cross_session_signal?: number | null;
+  cross_session_signal_reason?: string | null;
   error?: string;
 }
 
