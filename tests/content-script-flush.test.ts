@@ -54,6 +54,9 @@ interface BehaviorSnapshot {
   viewportWidth: number;
   viewportHeight: number;
   pixelRatio: number;
+  // Diagnostic (think-time cadence) — not scored
+  burstRatio: number | null;
+  interEventGapStd: number | null;
 }
 
 // ─── State (mirrors content-script.ts module-level state) ───────────
@@ -94,6 +97,27 @@ function buildSnapshot(s: State): BehaviorSnapshot {
   }
   const keystrokeHolds = s.keystrokes.map((k) => k.duration);
 
+  // Diagnostic: compute burstRatio and interEventGapStd (mirrors content-script.ts)
+  const allTimestamps: number[] = [];
+  for (const k of s.keystrokes) allTimestamps.push(k.timestamp);
+  for (const m of s.mouseEvents) allTimestamps.push(m.timestamp);
+  for (const sc of s.scrollEvents) allTimestamps.push(sc.timestamp);
+
+  let burstRatio: number | null = null;
+  let interEventGapStd: number | null = null;
+  if (allTimestamps.length >= 2) {
+    allTimestamps.sort((a, b) => a - b);
+    const activeSpan = allTimestamps[allTimestamps.length - 1] - allTimestamps[0];
+    burstRatio = Math.min(1, activeSpan / 5000);
+    const gaps: number[] = [];
+    for (let i = 1; i < allTimestamps.length; i++) {
+      gaps.push(allTimestamps[i] - allTimestamps[i - 1]);
+    }
+    const gapMean = gaps.reduce((sum, v) => sum + v, 0) / gaps.length;
+    const gapVariance = gaps.reduce((sum, v) => sum + (v - gapMean) ** 2, 0) / gaps.length;
+    interEventGapStd = Math.sqrt(gapVariance);
+  }
+
   return {
     keystrokeIntervals,
     keystrokeHolds,
@@ -110,6 +134,8 @@ function buildSnapshot(s: State): BehaviorSnapshot {
     viewportWidth: 1920,
     viewportHeight: 1080,
     pixelRatio: 1,
+    burstRatio,
+    interEventGapStd,
   };
 }
 

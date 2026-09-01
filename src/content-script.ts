@@ -53,6 +53,13 @@ interface BehaviorSnapshot {
   viewportWidth: number;
   viewportHeight: number;
   pixelRatio: number;
+  // ── Diagnostic fields (think-time cadence calibration) ──
+  // NOT scored by computeDivergence or any risk engine. Collected passively
+  // for offline calibration against black-box attack data. See analysis:
+  // "Think-time cadence" — burst/silence pattern of vision agents.
+  // null when < 2 events in the window (not calculable, not 0).
+  burstRatio: number | null;
+  interEventGapStd: number | null;
 }
 
 // ─── State ──────────────────────────────────────────────────────────
@@ -187,6 +194,57 @@ function computeStats(arr: number[]): { avg: number | null; variance: number | n
   return { avg, variance };
 }
 
+/**
+ * Diagnostic: compute burstRatio and interEventGapStd from all event
+ * timestamps in the current window. These are NOT scored — collected
+ * for offline calibration of think-time cadence detection.
+ *
+ * - burstRatio: (lastEvent - firstEvent) / FLUSH_INTERVAL_MS. Measures
+ *   what fraction of the 5s window contained actual activity. A vision
+ *   agent that acts for 1.5s then waits 3.5s → burstRatio ≈ 0.3.
+ *   A human interacting continuously → burstRatio ≈ 0.9.
+ * - interEventGapStd: standard deviation of inter-event gaps (ms).
+ *   A burst-then-silence pattern produces high std (few ms during burst,
+ *   several seconds during silence). Continuous interaction → low std.
+ *
+ * Returns { null, null } when < 2 events (not calculable).
+ */
+function computeCadenceDiagnostics(): {
+  burstRatio: number | null;
+  interEventGapStd: number | null;
+} {
+  // Collect all timestamps from the three event arrays
+  const allTimestamps: number[] = [];
+  for (const k of keystrokes) allTimestamps.push(k.timestamp);
+  for (const m of mouseEvents) allTimestamps.push(m.timestamp);
+  for (const s of scrollEvents) allTimestamps.push(s.timestamp);
+
+  if (allTimestamps.length < 2) {
+    return { burstRatio: null, interEventGapStd: null };
+  }
+
+  allTimestamps.sort((a, b) => a - b);
+
+  const firstTs = allTimestamps[0];
+  const lastTs = allTimestamps[allTimestamps.length - 1];
+  const activeSpan = lastTs - firstTs;
+  const burstRatio = Math.min(1, activeSpan / FLUSH_INTERVAL_MS);
+
+  // Inter-event gaps
+  const gaps: number[] = [];
+  for (let i = 1; i < allTimestamps.length; i++) {
+    gaps.push(allTimestamps[i] - allTimestamps[i - 1]);
+  }
+  const gapMean = gaps.reduce((s, v) => s + v, 0) / gaps.length;
+  const gapVariance = gaps.reduce((s, v) => s + (v - gapMean) ** 2, 0) / gaps.length;
+  const interEventGapStd = Math.sqrt(gapVariance);
+
+  return {
+    burstRatio: Math.round(burstRatio * 1000) / 1000,
+    interEventGapStd: Math.round(interEventGapStd * 100) / 100,
+  };
+}
+
 function buildSnapshot(): BehaviorSnapshot {
   // Keystroke intervals
   const keystrokeIntervals: number[] = [];
@@ -194,6 +252,8 @@ function buildSnapshot(): BehaviorSnapshot {
     keystrokeIntervals.push(keystrokes[i].timestamp - keystrokes[i - 1].timestamp);
   }
   const keystrokeHolds = keystrokes.map((k) => k.duration);
+
+  const cadenceDiag = computeCadenceDiagnostics();
 
   return {
     keystrokeIntervals,
@@ -211,6 +271,9 @@ function buildSnapshot(): BehaviorSnapshot {
     viewportWidth: window.innerWidth,
     viewportHeight: window.innerHeight,
     pixelRatio: window.devicePixelRatio || 1,
+    // Diagnostic (think-time cadence calibration) — NOT scored
+    burstRatio: cadenceDiag.burstRatio,
+    interEventGapStd: cadenceDiag.interEventGapStd,
   };
 }
 

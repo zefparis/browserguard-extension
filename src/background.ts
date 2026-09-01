@@ -99,6 +99,9 @@ export interface BehaviorSnapshot {
   viewportWidth?: number;
   viewportHeight?: number;
   pixelRatio?: number;
+  // Diagnostic (think-time cadence calibration) — NOT scored by any engine
+  burstRatio?: number | null;
+  interEventGapStd?: number | null;
 }
 
 export interface BackendResponse {
@@ -117,6 +120,9 @@ export interface BackendResponse {
   // Experimental observability (Phase 1) — not consumed by the extension.
   cross_session_signal?: number | null;
   cross_session_signal_reason?: string | null;
+  // Diagnostic (think-time cadence calibration) — not consumed by the extension.
+  diag_burstRatio?: number | null;
+  diag_interEventGapStd?: number | null;
   error?: string;
 }
 
@@ -354,6 +360,10 @@ export function buildBackendSnapshot(snap: BehaviorSnapshot) {
     scrollEventCount: snap.scrollEventCount,
     totalEvents: snap.totalEvents,
     timestamp: snap.timestamp,
+    // Diagnostic (think-time cadence calibration) — NOT scored by any engine.
+    // Passed through as top-level fields, not nested, to keep the payload flat.
+    burstRatio: snap.burstRatio ?? null,
+    interEventGapStd: snap.interEventGapStd ?? null,
   };
 }
 
@@ -429,6 +439,9 @@ export async function sendBeacon(): Promise<void> {
       referenceWindowActive: data.referenceWindowActive,
       invalidated: data.invalidated,
       stepUpInProgress,
+      // Diagnostic (think-time cadence) — echoed back by server, not consumed
+      diag_burstRatio: data.diag_burstRatio,
+      diag_interEventGapStd: data.diag_interEventGapStd,
     }));
 
     // ── Session invalidation: stop beaconing silently ──
