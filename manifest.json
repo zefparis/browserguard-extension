@@ -19,6 +19,13 @@
     "extension_pages": "script-src 'self'; object-src 'self'; frame-src https://challenge.hcs-u7.org https://api.hcs-u7.org;"
   },
 
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+
   "background": {
     "service_worker": "src/background.js"
   },
@@ -32,7 +39,13 @@
   ],
 
   "action": {
-    "default_title": "BrowserGuard"
+    "default_title": "BrowserGuard",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
   },
 
   "web_accessible_resources": [

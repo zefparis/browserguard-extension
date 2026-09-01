@@ -14,7 +14,7 @@
  *   browserguard-v0.1.0.zip — ready to upload to Chrome Web Store
  */
 import { build } from 'esbuild';
-import { copyFileSync, mkdirSync, rmSync, readFileSync, writeFileSync, existsSync } from 'fs';
+import { copyFileSync, mkdirSync, rmSync, readFileSync, writeFileSync, existsSync, readdirSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import { execSync } from 'child_process';
@@ -65,6 +65,21 @@ for (const [src, dest] of assets) {
   mkdirSync(dirname(destPath), { recursive: true });
   copyFileSync(srcPath, destPath);
   console.log(`[build:publish] ${src} → dist-publish/${dest}`);
+}
+
+// ── Copy icons/ directory (if it contains PNGs) ──
+const iconsSrcDir = join(root, 'icons');
+const iconsDestDir = join(distPublish, 'icons');
+if (existsSync(iconsSrcDir)) {
+  mkdirSync(iconsDestDir, { recursive: true });
+  const iconFiles = readdirSync(iconsSrcDir).filter(f => f.endsWith('.png'));
+  for (const f of iconFiles) {
+    copyFileSync(join(iconsSrcDir, f), join(iconsDestDir, f));
+    console.log(`[build:publish] icons/${f} → dist-publish/icons/${f}`);
+  }
+  if (iconFiles.length === 0) {
+    console.log('[build:publish] icons/ exists but contains no PNGs — manifest references will fail to load until icons are deposited');
+  }
 }
 
 // ── Generate manifest.json WITHOUT the "key" field ──

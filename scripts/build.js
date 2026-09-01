@@ -11,7 +11,7 @@
  * are no residual export/import statements in the output.
  */
 import { build } from 'esbuild';
-import { copyFileSync, mkdirSync, rmSync } from 'fs';
+import { copyFileSync, mkdirSync, rmSync, readdirSync, existsSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -63,6 +63,21 @@ for (const [src, dest] of assets) {
   mkdirSync(dirname(destPath), { recursive: true });
   copyFileSync(srcPath, destPath);
   console.log(`[copy] ${src} → dist/${dest}`);
+}
+
+// ── Copy icons/ directory (if it contains PNGs) ──
+const iconsSrcDir = join(root, 'icons');
+const iconsDestDir = join(dist, 'icons');
+if (existsSync(iconsSrcDir)) {
+  mkdirSync(iconsDestDir, { recursive: true });
+  const iconFiles = readdirSync(iconsSrcDir).filter(f => f.endsWith('.png'));
+  for (const f of iconFiles) {
+    copyFileSync(join(iconsSrcDir, f), join(iconsDestDir, f));
+    console.log(`[copy] icons/${f} → dist/icons/${f}`);
+  }
+  if (iconFiles.length === 0) {
+    console.log('[copy] icons/ exists but contains no PNGs — manifest references will fail to load until icons are deposited');
+  }
 }
 
 console.log('[build] done');
