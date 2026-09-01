@@ -229,9 +229,29 @@ function flush(): void {
     // Service worker may be inactive — silently ignore
   }
 
-  // Reset accumulators but keep raw event arrays for longitudinal stats
+  // Reset all accumulators so the next snapshot reflects only the next
+  // 5s window. Previously only mouseSpeeds/mouseCurvatures were reset,
+  // causing keystrokes/mouseEvents/scrollEvents/scrollSpeeds/pauseCounts
+  // to accumulate across windows — sending cumulative counts to the
+  // server instead of per-window counts.
+  keystrokes.length = 0;
+  mouseEvents.length = 0;
+  scrollEvents.length = 0;
   mouseSpeeds = [];
   mouseCurvatures = [];
+  scrollSpeeds = [];
+  mousePauseCount = 0;
+  scrollPauseCount = 0;
+
+  // Reset tracking variables so the first event in the new window doesn't
+  // compute speed/interval/curvature relative to a stale point from the
+  // previous window (which would produce artificially low speeds or
+  // inflated intervals spanning the 5s gap).
+  lastKeystrokeTime = 0;
+  lastScrollTime = 0;
+  lastScrollY = 0;
+  prevMouseMove = null;
+  prevPrevMouseMove = null;
 }
 
 // ─── Init ───────────────────────────────────────────────────────────
