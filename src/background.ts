@@ -112,6 +112,17 @@ let autoBeaconPaused: boolean = false;
 // helper, so a new session always starts with a clean beacon cycle.
 let sessionInvalidated: boolean = false;
 
+// ─── Local popup failure backoff (Correctif 4 — defensive) ──────────
+// If chrome.windows.create fails repeatedly (e.g. popup blocker, resource
+// exhaustion), stop trying to open popups for 120s after 3 consecutive
+// failures. This is a LOCAL safety net — the primary protection is the
+// backend cooldown (Correctif 1+2). Not persisted: loss on SW restart is
+// acceptable (the backend cooldown still applies).
+let consecutivePopupFailures: number = 0;
+let lastPopupFailureAt: number = 0;
+const POPUP_FAILURE_THRESHOLD = 3;
+const POPUP_FAILURE_BACKOFF_MS = 120_000;
+
 // Safety timeout: if no result/error is received within 90s, force-reset
 // stepUpInProgress so future beacons can trigger a new step-up.
 // 90s > 60s (step-up.ts timeout) to let the normal close flow happen first.
@@ -374,8 +385,21 @@ export async function sendBeacon(): Promise<void> {
 
     // Check for step-up requirement
     if (data.step_up_required === true && data.step_up_url && !stepUpInProgress) {
-      console.info('[BrowserGuard] Step-up required, triggering popup');
-      triggerStepUp(data.step_up_url);
+      // Correctif 4: local backoff after consecutive popup open failures.
+      // If chrome.windows.create has failed 3+ times in the last 120s,
+      // skip the trigger to avoid spamming failed popup attempts. The
+      // backend cooldown (Correctif 1+2) is the primary protection; this
+      // is a defensive local net for when the backend doesn't cooperate.
+      if (
+        consecutivePopupFailures >= POPUP_FAILURE_THRESHOLD &&
+        (Date.now() - lastPopupFailureAt) < POPUP_FAILURE_BACKOFF_MS
+      ) {
+        const remaining = Math.ceil((POPUP_FAILURE_BACKOFF_MS - (Date.now() - lastPopupFailureAt)) / 1000);
+        console.warn(`[BrowserGuard] Step-up required but skipping popup — ${consecutivePopupFailures} consecutive open failures, local backoff ${remaining}s remaining`);
+      } else {
+        console.info('[BrowserGuard] Step-up required, triggering popup');
+        triggerStepUp(data.step_up_url);
+      }
     } else if (data.step_up_required === true && !data.step_up_url) {
       console.warn('[BrowserGuard] Step-up required but no step_up_url in response');
     } else if (data.step_up_required === true && stepUpInProgress) {
@@ -535,6 +559,14 @@ export function triggerStepUp(stepUpUrl: string): void {
     }, (window) => {
       if (chrome.runtime.lastError) {
         console.error('[BrowserGuard] Failed to open step-up window:', chrome.runtime.lastError);
+        // Correctif 2: notify backend so it sets a cooldown (infra_error →
+        // 60s fixed, no consecutiveNonGoCount increment). Without this, the
+        // backend never learns the step-up ended and the next beacon (5s)
+        // will get step_up_required: true again → popup spam loop.
+        notifyStepUpEnd(sessionId, false, 'POPUP_OPEN_FAILED', 0, 0);
+        // Correctif 4: track consecutive failures for local backoff
+        consecutivePopupFailures++;
+        lastPopupFailureAt = Date.now();
         clearStepUpState();
         return;
       }
@@ -543,6 +575,8 @@ export function triggerStepUp(stepUpUrl: string): void {
         console.info('[BrowserGuard] Step-up popup opened, windowId=', window.id);
         // Persist the windowId now that we have it
         persistStepUpState();
+        // Correctif 4: reset failure counter on successful popup open
+        consecutivePopupFailures = 0;
       }
     });
   });
@@ -673,6 +707,7 @@ export function __testGetState() {
     snapshotEvents: lastSnapshot?.totalEvents ?? 0,
     autoBeaconPaused,
     sessionInvalidated,
+    consecutivePopupFailures,
   };
 }
 
@@ -694,6 +729,8 @@ export function __testSetSnapshot(snap: BehaviorSnapshot | null): void {
 export function __testResetStepUp(): void {
   clearStepUpState();
   sessionInvalidated = false;
+  consecutivePopupFailures = 0;
+  lastPopupFailureAt = 0;
 }
 
 // ─── Lifecycle ──────────────────────────────────────────────────────
