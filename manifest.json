@@ -6,7 +6,8 @@
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAqbdjNxEfbynNO4wgtGm8wzjN/A4KRkYKIBs3rKuHkeHTTN9xX18/VKjXpMOOrVhCvFc52fRuNJeQKLGL87oVx/5BxU9ZFmDAYpInKGSKyS5G+n6/O5E/kSfDhQnoGZXwsXZTOJUrXaxgFsxeetsar9pS8NXygkMSk70G9tDNrdYyeHZTLSjsnwVbTS9JEPRyFJz7mAFPjwkTcduMc91cViJ6iDgvoKQXyK5xTGrRo3zwwpmuWXOQULrEY4aUYyfa1zEN7Q0QgtA2njL18D4V8RSb43mzw3hirXpNz7SmtzjmilVqLISotPVWcGVxu1JXWBNZX9XIy9ec1qXK7J7quQIDAQAB",
 
   "permissions": [
-    "storage"
+    "storage",
+    "alarms"
   ],
 
   "host_permissions": [

@@ -32,11 +32,54 @@ const isServiceWorkerContext =
   typeof chrome.runtime.id === 'string' &&
   chrome.runtime.id !== 'vitest-test-extension';
 
+// ─── chrome.alarms listener (top-level, synchronous) ───────────────
+// Must be registered at the top level of the service worker script so it
+// is available immediately on SW restart. If registered inside an async
+// function, the SW may miss the first alarm event after restart.
+// Guarded by isServiceWorkerContext so it doesn't run in tests.
+if (isServiceWorkerContext && typeof chrome.alarms !== 'undefined') {
+  chrome.alarms.onAlarm.addListener((alarm) => {
+    if (alarm.name === BEACON_ALARM_NAME) {
+      void sendBeacon();
+    }
+  });
+}
+
 // ─── Config ─────────────────────────────────────────────────────────
 
 const BEACON_INTERVAL_MS = 5_000; // ≥5s to stay under 20 req/min Worker rate limit
 const BACKEND_URL = 'https://api.hcs-u7.org/hv/api/browserguard/session-behavior-ping';
 const STEP_UP_URL_BASE = 'https://challenge.hcs-u7.org/embed/';
+
+// ─── Beacon scheduling (hybrid: setInterval + chrome.alarms) ────────
+//
+// MV3 service workers are killed by Chrome after ~30s of idleness. When
+// killed, setInterval stops permanently and is NOT recreated on restart
+// until the lifecycle block runs again. chrome.alarms survives SW kills
+// and wakes the SW at the scheduled time.
+//
+// However, chrome.alarms has a minimum period of ~1 minute in release
+// builds (Chrome clamps periodInMinutes < 1 to 1). This is too coarse
+// for our 5s beacon cadence.
+//
+// Solution: hybrid scheduling.
+//   - setInterval(sendBeacon, 5000) provides the fine 5s cadence while
+//     the SW is alive (the normal case — the SW stays alive as long as
+//     it receives events from content scripts or active fetches).
+//   - chrome.alarms with periodInMinutes: 1 acts as a safety net: if the
+//     SW is killed, the alarm wakes it, the lifecycle block recreates
+//     the setInterval, and the beacon resumes. The alarm itself also
+//     calls sendBeacon directly (in case the SW was killed mid-interval
+//     and a snapshot is waiting).
+//
+// The alarm fires at most once per minute — much less frequent than the
+// 5s setInterval — so it does not duplicate beacons in practice. When
+// both fire close together, sendBeacon's idempotency guards (skip if
+// step-up in progress, skip if session invalidated, skip if no snapshot)
+// prevent double sends.
+
+const BEACON_ALARM_NAME = 'browserguard_beacon';
+const BEACON_ALARM_PERIOD_MIN = 1; // minimum allowed by Chrome in release builds
 
 // ─── Types ──────────────────────────────────────────────────────────
 
@@ -152,6 +195,23 @@ interface StepUpState {
 }
 
 const STEP_UP_STATE_KEY = 'browserguard_stepUpState';
+
+// ─── Beacon alarm management ────────────────────────────────────────
+// ensureBeaconAlarm creates the chrome.alarm if it doesn't exist yet.
+// chrome.alarms.create with the same name replaces any existing alarm
+// with the same name (idempotent), so calling this on every SW restart
+// is safe — no duplicate alarms accumulate.
+function ensureBeaconAlarm(): void {
+  if (!isServiceWorkerContext || typeof chrome.alarms === 'undefined') return;
+  chrome.alarms.create(BEACON_ALARM_NAME, { periodInMinutes: BEACON_ALARM_PERIOD_MIN });
+}
+
+// clearBeaconAlarm removes the safety-net alarm. Used when the session is
+// invalidated or the beacon is permanently stopped for this session.
+function clearBeaconAlarm(): void {
+  if (!isServiceWorkerContext || typeof chrome.alarms === 'undefined') return;
+  chrome.alarms.clear(BEACON_ALARM_NAME);
+}
 
 function clearStepUpState(): void {
   stepUpInProgress = false;
@@ -380,6 +440,7 @@ export async function sendBeacon(): Promise<void> {
         clearInterval(beaconTimer);
         beaconTimer = null;
       }
+      clearBeaconAlarm();
       console.info('[BrowserGuard] Session invalidated by backend — beacon cycle stopped for this session');
       // Do NOT trigger step-up even if step_up_required is also true —
       // an invalidated session is already closed, step-up is meaningless.
@@ -474,11 +535,13 @@ if (isServiceWorkerContext) {
         clearInterval(beaconTimer);
         beaconTimer = null;
       }
+      clearBeaconAlarm();
       autoBeaconPaused = true;
       console.info('[BrowserGuard] Auto beacon paused — manual testing mode active');
     },
     resumeAutoBeacon: () => {
       if (!beaconTimer) {
+        ensureBeaconAlarm();
         beaconTimer = setInterval(sendBeacon, BEACON_INTERVAL_MS);
       }
       autoBeaconPaused = false;
@@ -842,14 +905,23 @@ if (isServiceWorkerContext) {
     });
   });
 
-  // Start periodic beacon
+  // Start periodic beacon — hybrid scheduling (see comment at top of file).
+  // setInterval provides the 5s cadence while the SW is alive.
+  // chrome.alarms acts as a safety net: it survives SW kills and wakes the
+  // SW, at which point this lifecycle block runs again and recreates the
+  // setInterval. The alarm itself also calls sendBeacon directly.
+  ensureBeaconAlarm();
   beaconTimer = setInterval(sendBeacon, BEACON_INTERVAL_MS);
 
-  // Clean up on suspend (MV3 service workers can be killed)
+  // Clean up on suspend (MV3 service workers can be killed).
+  // We clear the setInterval but deliberately KEEP the chrome.alarm alive —
+  // the alarm is designed to survive SW suspension and wake the SW on the
+  // next fire. Clearing it here would defeat its purpose as a safety net.
   self.addEventListener('beforeunload', () => {
     console.info('[BrowserGuard] Service worker suspending — state will be lost');
     if (beaconTimer) clearInterval(beaconTimer);
     if (stepUpSafetyTimer) clearTimeout(stepUpSafetyTimer);
+    // Note: chrome.alarms is intentionally NOT cleared here.
   });
 } else {
   // In tests (or any non-SW context), resolve immediately so ensureSession()

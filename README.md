@@ -89,6 +89,7 @@ Part of the HCS-U7 ecosystem. Routes traffic through the Cloudflare Worker `hcs-
 | Permission | Justification |
 |-----------|---------------|
 | `storage` | Persist session ID across service worker restarts (MV3 kills SWs) |
+| `alarms` | Safety-net alarm that survives SW kills and wakes the SW to resume the 5s beacon cycle (see [Beacon scheduling](#beacon-scheduling-hybrid-setinterval--chromealarms)) |
 | `host_permissions: https://api.hcs-u7.org/hv/*` | Beacon to backend through the Worker proxy |
 
 No `tabs`, `history`, `cookies`, or `webRequest` permissions — minimal surface.
@@ -142,6 +143,32 @@ The extension is configured via constants in `src/background.ts`:
 - The step-up iframe is sandboxed (`allow-scripts allow-same-origin`).
 - `callbackOrigin` is always `chrome-extension://<id>` — never `*`.
 - The GateGuard embed validates `callbackOrigin` and refuses invalid origins.
+
+## Beacon scheduling (hybrid: setInterval + chrome.alarms)
+
+MV3 service workers are killed by Chrome after ~30s of idleness. When killed,
+`setInterval` stops permanently and is not recreated until the SW restarts and
+the lifecycle block runs again.
+
+`chrome.alarms` survives SW kills and wakes the SW at the scheduled time, but
+has a **minimum period of ~1 minute** in release builds (Chrome clamps
+`periodInMinutes < 1` to 1). This is too coarse for the 5s beacon cadence.
+
+**Solution: hybrid scheduling.**
+
+| Mechanism | Period | Role |
+|-----------|--------|------|
+| `setInterval(sendBeacon, 5000)` | 5s | Fine cadence while SW is alive |
+| `chrome.alarms` (`browserguard_beacon`) | 1 min | Safety net — wakes SW after kill, calls `sendBeacon` directly, and triggers lifecycle block which recreates the `setInterval` |
+
+The alarm fires at most once per minute — much less frequent than the 5s
+`setInterval` — so it does not duplicate beacons in practice. When both fire
+close together, `sendBeacon`'s idempotency guards (skip if step-up in progress,
+skip if session invalidated, skip if no snapshot) prevent double sends.
+
+The alarm is **not cleared** on `beforeunload` (SW suspend) — it is designed to
+survive and wake the SW. It is cleared only when the session is invalidated by
+the backend or when the beacon is paused via the debug API.
 
 ## Related Repos
 

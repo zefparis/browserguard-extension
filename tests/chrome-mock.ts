@@ -94,12 +94,47 @@ const storage = {
   },
 };
 
+// ─── chrome.alarms ──────────────────────────────────────────────────
+// Minimal mock: tracks created alarms and fires onAlarm listeners.
+// Tests can emit alarms via getAlarmsOnAlarm().emit() to simulate
+// chrome.alarms waking the service worker.
+
+interface MockAlarm {
+  name: string;
+  periodInMinutes?: number;
+  scheduledTime: number;
+}
+
+const alarmsStore: Map<string, MockAlarm> = new Map();
+
+const alarms = {
+  onAlarm: new MockEvent<[chrome.alarms.Alarm]>(),
+  create: (name: string, alarmInfo: chrome.alarms.AlarmCreateInfo): void => {
+    // chrome.alarms.create replaces any existing alarm with the same name
+    alarmsStore.set(name, {
+      name,
+      periodInMinutes: alarmInfo.periodInMinutes,
+      scheduledTime: Date.now() + (alarmInfo.delayInMinutes ?? 0) * 60_000,
+    });
+  },
+  clear: (name: string): boolean => {
+    return alarmsStore.delete(name);
+  },
+  get: (name: string): MockAlarm | undefined => {
+    return alarmsStore.get(name);
+  },
+  getAll: (): MockAlarm[] => {
+    return Array.from(alarmsStore.values());
+  },
+};
+
 // ─── Assemble global chrome ─────────────────────────────────────────
 
 const chromeMock = {
   runtime,
   windows,
   storage,
+  alarms,
 };
 
 // Expose on globalThis so `typeof chrome !== 'undefined'` is true in tests
@@ -112,6 +147,8 @@ export function resetChromeMock(): void {
   runtime.lastError = undefined;
   runtime.onMessage = new MockEvent();
   windows.onRemoved = new MockEvent();
+  alarms.onAlarm = new MockEvent();
+  alarmsStore.clear();
   for (const k of Object.keys(storageData)) delete storageData[k];
 }
 
@@ -125,6 +162,21 @@ export function getWindowsOnRemoved(): MockEvent<[number]> {
 
 export function getRuntimeOnMessage(): MockEvent<[any, any, any]> {
   return runtime.onMessage;
+}
+
+export function getAlarmsOnAlarm(): MockEvent<[chrome.alarms.Alarm]> {
+  return alarms.onAlarm;
+}
+
+export function getAlarmFromStore(name: string): MockAlarm | undefined {
+  return alarmsStore.get(name);
+}
+
+export function emitAlarm(name: string): void {
+  const alarm = alarmsStore.get(name);
+  if (alarm) {
+    alarms.onAlarm.emit(alarm as chrome.alarms.Alarm);
+  }
 }
 
 export function setRuntimeId(id: string): void {
