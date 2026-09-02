@@ -87,10 +87,18 @@ let scrollSpeeds: number[] = [];
 let keyDownTime = 0;
 
 document.addEventListener('keydown', (e) => {
+  // SECURITY: reject synthetic events dispatched by the page via
+  // dispatchEvent(). isTrusted is set by the browser and cannot be
+  // forged — only real user-generated events have isTrusted=true.
+  // Without this check, a malicious page sharing the DOM with this
+  // content script can forge a "perfect human" behavioral profile.
+  if (!e.isTrusted) return;
   keyDownTime = performance.now();
 }, { passive: true });
 
 document.addEventListener('keyup', (e) => {
+  // SECURITY: reject synthetic events (see keydown handler above).
+  if (!e.isTrusted) return;
   if (keyDownTime === 0) return;
   const now = performance.now();
   const holdDuration = now - keyDownTime;
@@ -112,6 +120,8 @@ let prevMouseMove: { x: number; y: number; t: number } | null = null;
 let prevPrevMouseMove: { x: number; y: number; t: number } | null = null;
 
 document.addEventListener('mousemove', (e) => {
+  // SECURITY: reject synthetic events (see keydown handler above).
+  if (!e.isTrusted) return;
   const now = performance.now();
   const evt = { timestamp: now, x: e.clientX, y: e.clientY };
 
@@ -159,7 +169,9 @@ document.addEventListener('mousemove', (e) => {
 
 // ─── Scroll capture ─────────────────────────────────────────────────
 
-document.addEventListener('scroll', () => {
+document.addEventListener('scroll', (e) => {
+  // SECURITY: reject synthetic events (see keydown handler above).
+  if (!e.isTrusted) return;
   const now = performance.now();
   const sy = window.scrollY;
 
