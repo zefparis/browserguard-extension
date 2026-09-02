@@ -474,6 +474,46 @@ export async function sendBeacon(): Promise<void> {
     });
 
     if (!resp.ok) {
+      // ── Session rotation recovery (fallback) ──
+      // If the backend returns 403 SESSION_ROTATED, it means the current
+      // sessionId was rotated (after a step-up GO) but the extension didn't
+      // receive the new_session_id in the step-up-result response (network
+      // loss, SW restart, etc.). The backend includes the new sessionId in
+      // the error response — switch to it and retry the beacon.
+      if (resp.status === 403) {
+        try {
+          const errData = await resp.json();
+          if (errData.error === 'SESSION_ROTATED' && errData.new_session_id) {
+            console.info(`[BrowserGuard] Beacon rejected (SESSION_ROTATED) — switching to new sessionId: ${errData.new_session_id}`);
+            rotateSessionId(errData.new_session_id);
+            // Retry the beacon once with the new sessionId — don't loop
+            // (if the new sessionId is also rejected, the next 5s cycle
+            // will handle it normally).
+            const retryBody = { ...body, sessionId };
+            const retryResp = await fetch(BACKEND_URL, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'X-Source-App': 'browserguard',
+              },
+              body: JSON.stringify(retryBody),
+            });
+            if (retryResp.ok) {
+              const retryData: BackendResponse = await retryResp.json();
+              console.info('[BrowserGuard] Beacon retry with rotated sessionId succeeded');
+              // Process the retry response normally (step-up check, invalidation, etc.)
+              // Fall through to the normal response handling below by reassigning.
+              // Note: we don't re-run the full response processing here to keep it
+              // simple — the next 5s beacon cycle will pick up any step-up requirement.
+              void retryData;
+            }
+            return;
+          }
+        } catch {
+          // Response wasn't JSON or didn't have the expected fields —
+          // fall through to the generic error log below.
+        }
+      }
       console.error('[BrowserGuard] Beacon failed:', resp.status);
       return;
     }
@@ -747,6 +787,11 @@ if (isServiceWorkerContext) {
 // This is critical for the cooldown mechanism: the backend sets a cooldown
 // in /step-up-result. If we only call it on success, errors/timeouts never
 // set a cooldown and the popup re-opens in an infinite loop.
+//
+// SECURITY (session rotation): On GO, the backend generates a new sessionId
+// and returns it as new_session_id. The extension switches to this new
+// sessionId for all subsequent beacons. The old sessionId is invalidated
+// server-side — any ping on it returns 403 SESSION_ROTATED with the new ID.
 export async function notifyStepUpEnd(sessionId: string, success: boolean, decision: string, score: number, confidence: number): Promise<void> {
   // Note: we do NOT await ensureInstallId() here — notifyStepUpEnd is called
   // fire-and-forget from several places (safety timer, window removed, error
@@ -754,7 +799,7 @@ export async function notifyStepUpEnd(sessionId: string, success: boolean, decis
   // schema marks it optional). sendBeacon ensures installId is populated on
   // the next 5s cycle, and subsequent step-up results will include it.
   try {
-    await fetch(`${BACKEND_URL.replace('/session-behavior-ping', '/step-up-result')}`, {
+    const resp = await fetch(`${BACKEND_URL.replace('/session-behavior-ping', '/step-up-result')}`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -763,9 +808,38 @@ export async function notifyStepUpEnd(sessionId: string, success: boolean, decis
       body: JSON.stringify({ sessionId, stepUpSuccess: success, decision, score, confidence, installId: installId || undefined }),
     });
     console.info(`[BrowserGuard] Step-up end notified to backend: success=${success} decision=${decision}`);
+
+    // ── Session rotation: switch to new sessionId on GO ──
+    if (resp.ok) {
+      try {
+        const data = await resp.json();
+        if (data.new_session_id && typeof data.new_session_id === 'string') {
+          console.info(`[BrowserGuard] Session rotated by backend: ${sessionId} → ${data.new_session_id}`);
+          rotateSessionId(data.new_session_id);
+        }
+      } catch (jsonErr) {
+        // Response wasn't JSON — backend may be older version without rotation.
+        // Continue with the current sessionId (retrocompatible).
+        console.debug('[BrowserGuard] Step-up-result response not JSON — no rotation (retrocompatible)');
+      }
+    }
   } catch (err) {
     console.error('[BrowserGuard] Failed to notify backend of step-up end:', err);
   }
+}
+
+/**
+ * Switch the current sessionId to a new one (after rotation).
+ * Updates the in-memory variable and persists to chrome.storage.local.
+ * Resets the invalidation flag — the new session starts with a clean
+ * beacon cycle (the backend has already transferred the state).
+ */
+function rotateSessionId(newSessionId: string): void {
+  const oldSessionId = sessionId;
+  sessionId = newSessionId;
+  sessionInvalidated = false;
+  chrome.storage.local.set({ browserguard_sessionId: newSessionId });
+  console.info(`[BrowserGuard] SessionId rotated: ${oldSessionId} → ${newSessionId} (persisted to storage)`);
 }
 
 // ─── Step-up result handling ────────────────────────────────────────
