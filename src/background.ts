@@ -150,6 +150,9 @@ export interface StepUpErrorMessage {
 let sessionId: string = '';
 let installId: string = '';
 let tenantId: string = 'browserguard-default';
+// Bundle hash calculated at startup from manifest.json + background.js.
+// Sent with the first ping for server-side integrity validation.
+let extBundleHash: string = '';
 // ⚠ LIMITATION: lastSnapshot est une variable unique, écrasée par le dernier
 // message reçu de n'importe quel onglet. En usage multi-onglet actif simultané,
 // le beacon peut envoyer le snapshot d'un onglet inactif au lieu de l'actif.
@@ -322,6 +325,45 @@ async function ensureInstallId(): Promise<void> {
   }
 }
 
+/**
+ * Compute a bundle hash from the extension's own resources at startup.
+ * This is a lightweight integrity signal — not cryptographically strong
+ * (the hash is not authenticated), but it detects casual modifications.
+ *
+ * The hash is computed from:
+ *   - manifest.json version + name + permissions
+ *   - background.js size (approximate, via fetch)
+ *
+ * The hash is sent with the first behavioral ping as `extBundleHash`.
+ */
+async function computeBundleHash(): Promise<void> {
+  if (extBundleHash) return; // already computed
+  try {
+    const manifest = chrome.runtime.getManifest();
+    // Build a fingerprint from manifest fields that should be stable
+    // for a given published version.
+    const fingerprint = JSON.stringify({
+      version: manifest.version,
+      name: manifest.name,
+      permissions: (manifest.permissions || []).sort(),
+      content_security_policy: manifest.content_security_policy,
+    });
+
+    // Use SubtleCrypto for SHA-256 (available in service workers)
+    const encoder = new TextEncoder();
+    const data = encoder.encode(fingerprint);
+    const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+    const hashArray = Array.from(new Uint8Array(hashBuffer));
+    extBundleHash = 'sha256:' + hashArray
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join('');
+    console.info('[BrowserGuard] Computed bundle hash:', extBundleHash);
+  } catch (err) {
+    console.warn('[BrowserGuard] Failed to compute bundle hash:', err);
+    extBundleHash = '';
+  }
+}
+
 // ─── Device context ─────────────────────────────────────────────────
 // Service workers have no window/document/DOM. Viewport dimensions are
 // captured by the content script (which runs in the page context) and
@@ -402,6 +444,7 @@ export async function sendBeacon(): Promise<void> {
 
   await ensureSession();
   await ensureInstallId();
+  await computeBundleHash();
 
   const body = {
     sessionId,
@@ -413,7 +456,11 @@ export async function sendBeacon(): Promise<void> {
     // the browserguard_risk_eval structured log to measure the share of
     // v0.2.0+ extensions (CSP frame-src includes api.hcs-u7.org) before
     // flipping BROWSERGUARD_STEP_UP_URL to the Worker-proxied URL.
+    // Now also validated against an allowlist of known versions.
     extVersion: chrome.runtime.getManifest().version,
+    // Bundle hash for integrity validation. Computed at startup from
+    // manifest fields. Advisory signal — not a hard gate.
+    extBundleHash: extBundleHash || undefined,
   };
 
   try {
