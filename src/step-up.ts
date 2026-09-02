@@ -110,9 +110,21 @@
 
   // ─── Listen for postMessage from the GateGuard iframe ─────────────
 
+  // SECURITY: Only accept postMessage from the GateGuard embed iframe.
+  // The iframe is loaded from challenge.hcs-u7.org (or the configured
+  // step-up domain). Without this check, any page/iframe that can load
+  // step-up.html (via web_accessible_resources) could forge a
+  // 'browserguard_stepup_result' message with decision='GO' and bypass
+  // the cognitive challenge entirely.
+  const TRUSTED_ORIGINS = new Set([
+    'https://challenge.hcs-u7.org',
+    'https://api.hcs-u7.org',
+  ]);
+
   window.addEventListener('message', (event) => {
-    // Only accept messages from the GateGuard embed iframe
-    // The iframe origin is challenge.hcs-u7.org (or the configured domain)
+    // Reject messages from untrusted origins
+    if (!TRUSTED_ORIGINS.has(event.origin)) return;
+
     const data = event.data;
 
     if (!data || typeof data !== 'object') return;

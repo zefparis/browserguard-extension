@@ -503,7 +503,16 @@ export async function sendBeacon(): Promise<void> {
 //   browserguard.test.setSnapshot({...})     — set a fake snapshot for testing
 //   browserguard.test.resetStepUp()          — force-reset stepUpInProgress
 //   browserguard.test.state()                — dump current state
-if (isServiceWorkerContext) {
+//
+// SECURITY: The entire debug API is wrapped in __DEBUG__ (a build-time
+// constant defined by esbuild). In production builds (build-publish.js),
+// __DEBUG__ is set to false and esbuild tree-shakes the entire block out
+// — the browserguard.test object is never exposed on globalThis in
+// production. In dev builds (build.js), __DEBUG__ is true and the API
+// is available for manual testing from the SW DevTools console.
+declare const __DEBUG__: boolean;
+
+if (isServiceWorkerContext && __DEBUG__) {
 (self as any).browserguard = {
   test: {
     triggerBeacon: () => sendBeacon(),
@@ -567,7 +576,7 @@ if (isServiceWorkerContext) {
     },
   },
 };
-} // end isServiceWorkerContext guard for debug exposure
+} // end isServiceWorkerContext + __DEBUG__ guard for debug exposure
 
 // ─── Step-up trigger ────────────────────────────────────────────────
 

@@ -32,6 +32,11 @@ const commonOptions = {
   sourcemap: false,
   legalComments: 'none',
   logLevel: 'info',
+  // __DEBUG__ is true in dev builds — enables the browserguard.test API
+  // on globalThis for manual testing from the SW DevTools console.
+  // In production (build-publish.js), __DEBUG__ is false and the entire
+  // debug block is tree-shaken out by esbuild.
+  define: { __DEBUG__: 'true' },
 };
 
 // ── Entry points ──

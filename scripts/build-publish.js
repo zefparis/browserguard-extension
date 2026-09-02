@@ -27,7 +27,13 @@ const distPublish = join(root, 'dist-publish');
 rmSync(distPublish, { recursive: true, force: true });
 mkdirSync(distPublish, { recursive: true });
 
-// ── Common esbuild options (identical to build.js) ──
+// ── Common esbuild options (production) ──
+// Differs from build.js:
+//   - __DEBUG__ = false → tree-shakes the browserguard.test debug API
+//   - drop: ['console'] → strips ALL console.log/info/warn/error/debug
+//     from the production bundle. This prevents leaking sessionId,
+//     installId, trust scores, and step-up URLs to anyone who opens
+//     the SW DevTools console.
 const commonOptions = {
   bundle: true,
   format: 'iife',
@@ -36,6 +42,10 @@ const commonOptions = {
   sourcemap: false,
   legalComments: 'none',
   logLevel: 'info',
+  minify: true,         // enables dead code elimination — removes the
+                        // if (isServiceWorkerContext && false) debug block
+  define: { __DEBUG__: 'false' },
+  drop: ['console'],
 };
 
 const entryPoints = [
