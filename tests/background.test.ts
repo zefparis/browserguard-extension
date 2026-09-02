@@ -60,6 +60,7 @@ function makeStepUpResult(overrides: Partial<StepUpResultMessage> = {}): StepUpR
     sessionId: GG_SESSION_ID, // deliberately different from BG_SESSION_ID
     completedCount: 5,
     plannedCount: 5,
+    proofToken: null,
     ...overrides,
   };
 }

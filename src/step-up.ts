@@ -131,6 +131,9 @@
 
     if (data.type === 'browserguard_stepup_result') {
       // Relay to background service worker
+      // SECURITY: proofToken is a signed attestation from GateGuard that
+      // the cognitive challenge was really completed with a GO decision.
+      // /step-up-result rejects GO without a valid proofToken.
       chrome.runtime.sendMessage({
         type: 'browserguard_stepup_result',
         decision: data.decision,
@@ -141,6 +144,7 @@
         sessionId: data.sessionId,
         completedCount: data.completedCount,
         plannedCount: data.plannedCount,
+        proofToken: data.proofToken || null,
       });
       // Auto-close after a short delay
       setTimeout(() => window.close(), 500);

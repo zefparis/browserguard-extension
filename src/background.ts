@@ -136,6 +136,9 @@ export interface StepUpResultMessage {
   sessionId: string;
   completedCount: number;
   plannedCount: number;
+  // SECURITY: Signed proof token from GateGuard /session/finalize.
+  // Required by /step-up-result for GO decisions (B1-critical fix).
+  proofToken: string | null;
 }
 
 export interface StepUpErrorMessage {
@@ -792,20 +795,25 @@ if (isServiceWorkerContext) {
 // and returns it as new_session_id. The extension switches to this new
 // sessionId for all subsequent beacons. The old sessionId is invalidated
 // server-side — any ping on it returns 403 SESSION_ROTATED with the new ID.
-export async function notifyStepUpEnd(sessionId: string, success: boolean, decision: string, score: number, confidence: number): Promise<void> {
+export async function notifyStepUpEnd(sessionId: string, success: boolean, decision: string, score: number, confidence: number, proofToken?: string | null): Promise<void> {
   // Note: we do NOT await ensureInstallId() here — notifyStepUpEnd is called
   // fire-and-forget from several places (safety timer, window removed, error
   // handler). If installId isn't set yet, we send it as undefined (the backend
   // schema marks it optional). sendBeacon ensures installId is populated on
   // the next 5s cycle, and subsequent step-up results will include it.
   try {
+    const body: Record<string, unknown> = { sessionId, stepUpSuccess: success, decision, score, confidence, installId: installId || undefined };
+    // SECURITY: Include proofToken for GO decisions — required by /step-up-result.
+    if (proofToken) {
+      body.proofToken = proofToken;
+    }
     const resp = await fetch(`${BACKEND_URL.replace('/session-behavior-ping', '/step-up-result')}`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'X-Source-App': 'browserguard',
       },
-      body: JSON.stringify({ sessionId, stepUpSuccess: success, decision, score, confidence, installId: installId || undefined }),
+      body: JSON.stringify(body),
     });
     console.info(`[BrowserGuard] Step-up end notified to backend: success=${success} decision=${decision}`);
 
@@ -867,7 +875,7 @@ export async function handleStepUpResult(result: StepUpResultMessage): Promise<v
   // emaDivergence reset under an orphan Redis key (browserguard:behavior:session:<gg_...>)
   // that the beacons never read, making the cooldown and the state repair
   // completely inoperative (re-trigger loop on every ping, even after a GO).
-  await notifyStepUpEnd(sessionId, success, result.decision, result.score, result.confidence);
+  await notifyStepUpEnd(sessionId, success, result.decision, result.score, result.confidence, result.proofToken);
 
   clearStepUpState();
 }
