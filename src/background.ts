@@ -51,6 +51,22 @@ const BEACON_INTERVAL_MS = 5_000; // ≥5s to stay under 20 req/min Worker rate 
 const BACKEND_URL = 'https://api.hcs-u7.org/hv/api/browserguard/session-behavior-ping';
 const STEP_UP_URL_BASE = 'https://challenge.hcs-u7.org/embed/';
 
+// ─── Beacon in-flight tracking + fetch timeout (audit v0.2.1) ───────
+// WITHOUT this guard, multiple sendBeacon() calls can overlap (setInterval
+// + chrome.alarms + manual triggerBeacon), sending concurrent fetches on
+// the same session. The backend's Redis lock serializes the read-modify-
+// write, but concurrent beacons inflate recentPingCount (mass-attempt
+// counter) — a triple overlap (36/min) can cross MASS_ATTEMPT_THRESHOLD=30
+// and cause unjustified invalidation.
+//
+// The AbortController timeout (10s) prevents resource exhaustion when the
+// backend hangs (accepts the TCP connection but never responds). Without
+// it, the 5s setInterval accumulates hanging fetches indefinitely, each
+// holding a connection.
+const BEACON_FETCH_TIMEOUT_MS = 10_000;
+let beaconInFlight: boolean = false;
+let beaconAbortController: AbortController | null = null;
+
 // ─── Beacon scheduling (hybrid: setInterval + chrome.alarms) ────────
 //
 // MV3 service workers are killed by Chrome after ~30s of idleness. When
@@ -372,14 +388,94 @@ async function computeBundleHash(): Promise<void> {
 // captured by the content script (which runs in the page context) and
 // passed in the behavior snapshot. We use those values if available,
 // otherwise fall back to defaults.
+//
+// Platform detection (audit v0.2.1 — P3 fix):
+//   Primary: navigator.userAgent (available in MV3 service workers).
+//            Detects Mobile/Tablet via UA string hints (Android, iPhone,
+//            iPad, Mobile token).
+//   Fallback: viewport ratio — if the content script reports a narrow
+//             viewport (<768px) with a high pixel ratio (≥2), infer
+//             mobile. This catches cases where the UA is ambiguous
+//             (e.g. Chrome on desktop with mobile emulation, or a
+//             future UA-string reduction that drops platform hints).
+//
+// The previous implementation hardcoded platform: 'desktop', causing
+// mobile users to be misclassified. The backend's normalizeByDevice
+// uses viewportWidth for speed normalization (correct regardless of
+// platform), but platform may be used for scoring calibration — a
+// mobile user classified as 'desktop' could get miscalibrated thresholds.
 
-function getDeviceContext(snap?: BehaviorSnapshot) {
-  return {
-    viewportWidth: snap?.viewportWidth ?? 1920,
-    viewportHeight: snap?.viewportHeight ?? 1080,
-    pixelRatio: snap?.pixelRatio ?? 1,
-    platform: 'desktop' as const,
-  };
+/**
+ * Detect platform from navigator.userAgent. Exported for testing.
+ *
+ * Detection logic (order matters — iPadOS 13+ reports as Macintosh):
+ *   1. iPad (iPadOS 13+): UA contains "Macintosh" + "Safari" but NOT
+ *      "Chrome" → check navigator.maxTouchPoints > 0 at call site.
+ *      In the SW context, we use the viewport+pixelRatio fallback for
+ *      this edge case (iPad reports a desktop-like UA but has a small
+ *      viewport and high pixelRatio).
+ *   2. Mobile: UA contains "Mobi" (covers "Mobile", "Mobile Safari"),
+ *      "Android", "iPhone", or "iPod".
+ *   3. Tablet: UA contains "iPad" or "Tablet" (some Android tablets).
+ *   4. Desktop: everything else.
+ */
+export function detectPlatformFromUA(ua: string | undefined): 'desktop' | 'mobile' | 'tablet' {
+  if (!ua) return 'desktop';
+  // iPadOS 13+ reports "Macintosh" in UA but is a tablet. The standard
+  // detection (Mozilla's recommendation) checks maxTouchPoints, but the
+  // SW doesn't have a reliable maxTouchPoints. We detect iPad explicitly
+  // via the "iPad" token (present in some iPadOS versions) and fall back
+  // to viewport-based detection in getDeviceContext for the Macintosh case.
+  if (/iPad|Tablet/i.test(ua)) return 'tablet';
+  // Mobile tokens — "Mobi" covers "Mobile" and "Mobile Safari".
+  // "Android" without "Tablet" → mobile (phones). "iPhone"/"iPod" → mobile.
+  if (/Mobi|Android|iPhone|iPod/i.test(ua)) return 'mobile';
+  return 'desktop';
+}
+
+/**
+ * Infer platform from viewport dimensions and pixel ratio (fallback when
+ * UA detection is ambiguous, e.g. iPadOS 13+ reporting as Macintosh).
+ *
+ * Heuristic: a narrow viewport (<768px CSS width) with high pixel ratio
+ * (≥2) is almost certainly a phone. A medium viewport (768-1024px) with
+ * high pixel ratio is likely a tablet. Everything else → desktop.
+ */
+export function inferPlatformFromViewport(
+  viewportWidth: number,
+  pixelRatio: number,
+): 'desktop' | 'mobile' | 'tablet' {
+  if (viewportWidth < 768 && pixelRatio >= 1.5) return 'mobile';
+  if (viewportWidth >= 768 && viewportWidth < 1024 && pixelRatio >= 1.5) return 'tablet';
+  return 'desktop';
+}
+
+function getDeviceContext(snap?: BehaviorSnapshot): {
+  viewportWidth: number;
+  viewportHeight: number;
+  pixelRatio: number;
+  platform: 'desktop' | 'mobile' | 'tablet';
+} {
+  const viewportWidth = snap?.viewportWidth ?? 1920;
+  const viewportHeight = snap?.viewportHeight ?? 1080;
+  const pixelRatio = snap?.pixelRatio ?? 1;
+
+  // Primary: navigator.userAgent (available in MV3 service workers)
+  let platform = detectPlatformFromUA(
+    typeof navigator !== 'undefined' ? navigator.userAgent : undefined
+  );
+
+  // Fallback: if UA says desktop but the viewport looks mobile/tablet,
+  // trust the viewport. This catches iPadOS 13+ (reports as Macintosh)
+  // and desktop browsers with mobile emulation enabled.
+  if (platform === 'desktop') {
+    const viewportPlatform = inferPlatformFromViewport(viewportWidth, pixelRatio);
+    if (viewportPlatform !== 'desktop') {
+      platform = viewportPlatform;
+    }
+  }
+
+  return { viewportWidth, viewportHeight, pixelRatio, platform };
 }
 
 // ─── Build snapshot for backend ─────────────────────────────────────
@@ -422,163 +518,210 @@ export function computeStats(arr: number[]): { avg: number | null; variance: num
 // ─── Beacon to backend ──────────────────────────────────────────────
 
 export async function sendBeacon(): Promise<void> {
+  // ── In-flight guard (audit v0.2.1) ──
+  // Prevents concurrent sendBeacon() calls from overlapping. Without this,
+  // a slow fetch (>5s) causes the next setInterval tick to launch a second
+  // fetch on the same session, inflating the backend's recentPingCount
+  // (mass-attempt counter) and potentially crossing the 30/60s threshold.
+  // Also prevents accumulation of hanging fetches when the backend is slow
+  // or unresponsive (combined with the AbortController timeout below).
+  //
+  // CRITICAL: beaconInFlight is set BEFORE any await. If it were set after
+  // the awaits (ensureSession, stepUpStateRestored, etc.), multiple
+  // concurrent calls could all pass the guard before any of them sets the
+  // flag — defeating the purpose. The outer try/finally ensures the flag
+  // is always reset, even on early returns or exceptions.
+  if (beaconInFlight) {
+    console.debug('[BrowserGuard] Beacon skipped: previous beacon still in flight');
+    return;
+  }
   if (!lastSnapshot || lastSnapshot.totalEvents === 0) {
     console.debug('[BrowserGuard] Beacon skipped: no snapshot or zero events');
     return;
   }
-  // Wait for step-up state restoration before checking stepUpInProgress.
-  // Without this, a post-restart beacon could see stepUpInProgress=false
-  // (stale) and open a duplicate popup while the original is still open (R7b).
-  await stepUpStateRestored;
-  if (stepUpInProgress) {
-    console.debug('[BrowserGuard] Beacon skipped: step-up in progress');
-    return;
-  }
-  if (sessionInvalidated) {
-    // The current session has been invalidated by the backend. There is no
-    // point continuing to beacon — the session is closed server-side. The
-    // beacon timer has already been stopped (see the invalidated handling
-    // below); this guard catches any stray beacon call (e.g. a manual
-    // triggerBeacon from the DevTools console). A new session (new sessionId
-    // via ensureSession) resets this flag and restarts the cycle.
-    console.debug('[BrowserGuard] Beacon skipped: session invalidated');
-    return;
-  }
 
-  await ensureSession();
-  await ensureInstallId();
-  await computeBundleHash();
-
-  const body = {
-    sessionId,
-    installId,
-    source: 'browserguard' as const,
-    snapshot: buildBackendSnapshot(lastSnapshot),
-    deviceContext: getDeviceContext(lastSnapshot),
-    // Extension version for adoption tracking. The backend logs this in
-    // the browserguard_risk_eval structured log to measure the share of
-    // v0.2.0+ extensions (CSP frame-src includes api.hcs-u7.org) before
-    // flipping BROWSERGUARD_STEP_UP_URL to the Worker-proxied URL.
-    // Now also validated against an allowlist of known versions.
-    extVersion: chrome.runtime.getManifest().version,
-    // Bundle hash for integrity validation. Computed at startup from
-    // manifest fields. Advisory signal — not a hard gate.
-    extBundleHash: extBundleHash || undefined,
-  };
-
+  beaconInFlight = true;
   try {
-    const resp = await fetch(BACKEND_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Source-App': 'browserguard',
-      },
-      body: JSON.stringify(body),
-    });
+    // Wait for step-up state restoration before checking stepUpInProgress.
+    // Without this, a post-restart beacon could see stepUpInProgress=false
+    // (stale) and open a duplicate popup while the original is still open (R7b).
+    await stepUpStateRestored;
+    if (stepUpInProgress) {
+      console.debug('[BrowserGuard] Beacon skipped: step-up in progress');
+      return;
+    }
+    if (sessionInvalidated) {
+      // The current session has been invalidated by the backend. There is no
+      // point continuing to beacon — the session is closed server-side. The
+      // beacon timer has already been stopped (see the invalidated handling
+      // below); this guard catches any stray beacon call (e.g. a manual
+      // triggerBeacon from the DevTools console). A new session (new sessionId
+      // via ensureSession) resets this flag and restarts the cycle.
+      console.debug('[BrowserGuard] Beacon skipped: session invalidated');
+      return;
+    }
 
-    if (!resp.ok) {
-      // ── Session rotation recovery (fallback) ──
-      // If the backend returns 403 SESSION_ROTATED, it means the current
-      // sessionId was rotated (after a step-up GO) but the extension didn't
-      // receive the new_session_id in the step-up-result response (network
-      // loss, SW restart, etc.). The backend includes the new sessionId in
-      // the error response — switch to it and retry the beacon.
-      if (resp.status === 403) {
-        try {
-          const errData = await resp.json();
-          if (errData.error === 'SESSION_ROTATED' && errData.new_session_id) {
-            console.info(`[BrowserGuard] Beacon rejected (SESSION_ROTATED) — switching to new sessionId: ${errData.new_session_id}`);
-            rotateSessionId(errData.new_session_id);
-            // Retry the beacon once with the new sessionId — don't loop
-            // (if the new sessionId is also rejected, the next 5s cycle
-            // will handle it normally).
-            const retryBody = { ...body, sessionId };
-            const retryResp = await fetch(BACKEND_URL, {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                'X-Source-App': 'browserguard',
-              },
-              body: JSON.stringify(retryBody),
-            });
-            if (retryResp.ok) {
-              const retryData: BackendResponse = await retryResp.json();
-              console.info('[BrowserGuard] Beacon retry with rotated sessionId succeeded');
-              // Process the retry response normally (step-up check, invalidation, etc.)
-              // Fall through to the normal response handling below by reassigning.
-              // Note: we don't re-run the full response processing here to keep it
-              // simple — the next 5s beacon cycle will pick up any step-up requirement.
-              void retryData;
+    await ensureSession();
+    await ensureInstallId();
+    await computeBundleHash();
+
+    const body = {
+      sessionId,
+      installId,
+      source: 'browserguard' as const,
+      snapshot: buildBackendSnapshot(lastSnapshot),
+      deviceContext: getDeviceContext(lastSnapshot),
+      // Extension version for adoption tracking. The backend logs this in
+      // the browserguard_risk_eval structured log to measure the share of
+      // v0.2.0+ extensions (CSP frame-src includes api.hcs-u7.org) before
+      // flipping BROWSERGUARD_STEP_UP_URL to the Worker-proxied URL.
+      // Now also validated against an allowlist of known versions.
+      extVersion: chrome.runtime.getManifest().version,
+      // Bundle hash for integrity validation. Computed at startup from
+      // manifest fields. Advisory signal — not a hard gate.
+      extBundleHash: extBundleHash || undefined,
+    };
+
+    // ── Fetch timeout (audit v0.2.1) ──
+    // AbortController + setTimeout enforces a 10s timeout — without it, a
+    // hanging backend (TCP accepted, no response) causes the fetch to hang
+    // indefinitely. Combined with beaconInFlight (which prevents new fetches
+    // while one is in flight), this ensures at most 1 hanging fetch at any
+    // time, auto-aborted after 10s.
+    beaconAbortController = new AbortController();
+    const timeoutId = setTimeout(() => {
+      beaconAbortController?.abort();
+    }, BEACON_FETCH_TIMEOUT_MS);
+
+    try {
+      const resp = await fetch(BACKEND_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Source-App': 'browserguard',
+        },
+        body: JSON.stringify(body),
+        signal: beaconAbortController.signal,
+      });
+
+      if (!resp.ok) {
+        // ── Session rotation recovery (fallback) ──
+        // If the backend returns 403 SESSION_ROTATED, it means the current
+        // sessionId was rotated (after a step-up GO) but the extension didn't
+        // receive the new_session_id in the step-up-result response (network
+        // loss, SW restart, etc.). The backend includes the new sessionId in
+        // the error response — switch to it and retry the beacon.
+        if (resp.status === 403) {
+          try {
+            const errData = await resp.json();
+            if (errData.error === 'SESSION_ROTATED' && errData.new_session_id) {
+              console.info(`[BrowserGuard] Beacon rejected (SESSION_ROTATED) — switching to new sessionId: ${errData.new_session_id}`);
+              rotateSessionId(errData.new_session_id);
+              // Retry the beacon once with the new sessionId — don't loop
+              // (if the new sessionId is also rejected, the next 5s cycle
+              // will handle it normally). Reuse the same AbortController
+              // signal — the 10s timeout covers the total time including
+              // the retry.
+              const retryBody = { ...body, sessionId };
+              const retryResp = await fetch(BACKEND_URL, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'X-Source-App': 'browserguard',
+                },
+                body: JSON.stringify(retryBody),
+                signal: beaconAbortController.signal,
+              });
+              if (retryResp.ok) {
+                const retryData: BackendResponse = await retryResp.json();
+                console.info('[BrowserGuard] Beacon retry with rotated sessionId succeeded');
+                // Process the retry response normally (step-up check, invalidation, etc.)
+                // Fall through to the normal response handling below by reassigning.
+                // Note: we don't re-run the full response processing here to keep it
+                // simple — the next 5s beacon cycle will pick up any step-up requirement.
+                void retryData;
+              }
+              return;
             }
-            return;
+          } catch {
+            // Response wasn't JSON or didn't have the expected fields —
+            // fall through to the generic error log below.
           }
-        } catch {
-          // Response wasn't JSON or didn't have the expected fields —
-          // fall through to the generic error log below.
         }
+        console.error('[BrowserGuard] Beacon failed:', resp.status);
+        return;
       }
-      console.error('[BrowserGuard] Beacon failed:', resp.status);
-      return;
-    }
 
-    const data: BackendResponse = await resp.json();
-    console.info('[BrowserGuard] Beacon response:', JSON.stringify({
-      step_up_required: data.step_up_required,
-      step_up_url: data.step_up_url,
-      trust_score_normalized: data.trust_score_normalized,
-      referenceWindowActive: data.referenceWindowActive,
-      invalidated: data.invalidated,
-      stepUpInProgress,
-      // Diagnostic (think-time cadence) — echoed back by server, not consumed
-      diag_burstRatio: data.diag_burstRatio,
-      diag_interEventGapStd: data.diag_interEventGapStd,
-    }));
+      const data: BackendResponse = await resp.json();
+      console.info('[BrowserGuard] Beacon response:', JSON.stringify({
+        step_up_required: data.step_up_required,
+        step_up_url: data.step_up_url,
+        trust_score_normalized: data.trust_score_normalized,
+        referenceWindowActive: data.referenceWindowActive,
+        invalidated: data.invalidated,
+        stepUpInProgress,
+        // Diagnostic (think-time cadence) — echoed back by server, not consumed
+        diag_burstRatio: data.diag_burstRatio,
+        diag_interEventGapStd: data.diag_interEventGapStd,
+      }));
 
-    // ── Session invalidation: stop beaconing silently ──
-    // The backend has closed this session (behavioral divergence, mass
-    // attempts, step-up fail-closed, etc.). There is no point continuing
-    // to beacon — stop the timer and mark the session as invalidated so
-    // future sendBeacon calls skip immediately. No UI, no popup, no user-
-    // visible effect — the extension just goes quiet for this session.
-    // A new session (new sessionId via ensureSession) resets the flag and
-    // restarts the beacon cycle.
-    if (data.invalidated === true) {
-      sessionInvalidated = true;
-      if (beaconTimer) {
-        clearInterval(beaconTimer);
-        beaconTimer = null;
+      // ── Session invalidation: stop beaconing silently ──
+      // The backend has closed this session (behavioral divergence, mass
+      // attempts, step-up fail-closed, etc.). There is no point continuing
+      // to beacon — stop the timer and mark the session as invalidated so
+      // future sendBeacon calls skip immediately. No UI, no popup, no user-
+      // visible effect — the extension just goes quiet for this session.
+      // A new session (new sessionId via ensureSession) resets the flag and
+      // restarts the beacon cycle.
+      if (data.invalidated === true) {
+        sessionInvalidated = true;
+        if (beaconTimer) {
+          clearInterval(beaconTimer);
+          beaconTimer = null;
+        }
+        clearBeaconAlarm();
+        console.info('[BrowserGuard] Session invalidated by backend — beacon cycle stopped for this session');
+        // Do NOT trigger step-up even if step_up_required is also true —
+        // an invalidated session is already closed, step-up is meaningless.
+        return;
       }
-      clearBeaconAlarm();
-      console.info('[BrowserGuard] Session invalidated by backend — beacon cycle stopped for this session');
-      // Do NOT trigger step-up even if step_up_required is also true —
-      // an invalidated session is already closed, step-up is meaningless.
-      return;
-    }
 
-    // Check for step-up requirement
-    if (data.step_up_required === true && data.step_up_url && !stepUpInProgress) {
-      // Correctif 4: local backoff after consecutive popup open failures.
-      // If chrome.windows.create has failed 3+ times in the last 120s,
-      // skip the trigger to avoid spamming failed popup attempts. The
-      // backend cooldown (Correctif 1+2) is the primary protection; this
-      // is a defensive local net for when the backend doesn't cooperate.
-      if (
-        consecutivePopupFailures >= POPUP_FAILURE_THRESHOLD &&
-        (Date.now() - lastPopupFailureAt) < POPUP_FAILURE_BACKOFF_MS
-      ) {
-        const remaining = Math.ceil((POPUP_FAILURE_BACKOFF_MS - (Date.now() - lastPopupFailureAt)) / 1000);
-        console.warn(`[BrowserGuard] Step-up required but skipping popup — ${consecutivePopupFailures} consecutive open failures, local backoff ${remaining}s remaining`);
+      // Check for step-up requirement
+      if (data.step_up_required === true && data.step_up_url && !stepUpInProgress) {
+        // Correctif 4: local backoff after consecutive popup open failures.
+        // If chrome.windows.create has failed 3+ times in the last 120s,
+        // skip the trigger to avoid spamming failed popup attempts. The
+        // backend cooldown (Correctif 1+2) is the primary protection; this
+        // is a defensive local net for when the backend doesn't cooperate.
+        if (
+          consecutivePopupFailures >= POPUP_FAILURE_THRESHOLD &&
+          (Date.now() - lastPopupFailureAt) < POPUP_FAILURE_BACKOFF_MS
+        ) {
+          const remaining = Math.ceil((POPUP_FAILURE_BACKOFF_MS - (Date.now() - lastPopupFailureAt)) / 1000);
+          console.warn(`[BrowserGuard] Step-up required but skipping popup — ${consecutivePopupFailures} consecutive open failures, local backoff ${remaining}s remaining`);
+        } else {
+          console.info('[BrowserGuard] Step-up required, triggering popup');
+          triggerStepUp(data.step_up_url);
+        }
+      } else if (data.step_up_required === true && !data.step_up_url) {
+        console.warn('[BrowserGuard] Step-up required but no step_up_url in response');
+      } else if (data.step_up_required === true && stepUpInProgress) {
+        console.debug('[BrowserGuard] Step-up required but already in progress, skipping');
+      }
+    } catch (err) {
+      // AbortError is expected when the 10s timeout fires — log at debug
+      // level to avoid spamming the console during a backend outage.
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        console.debug('[BrowserGuard] Beacon timed out after', BEACON_FETCH_TIMEOUT_MS, 'ms — backend unresponsive');
       } else {
-        console.info('[BrowserGuard] Step-up required, triggering popup');
-        triggerStepUp(data.step_up_url);
+        console.error('[BrowserGuard] Beacon error:', err);
       }
-    } else if (data.step_up_required === true && !data.step_up_url) {
-      console.warn('[BrowserGuard] Step-up required but no step_up_url in response');
-    } else if (data.step_up_required === true && stepUpInProgress) {
-      console.debug('[BrowserGuard] Step-up required but already in progress, skipping');
+    } finally {
+      clearTimeout(timeoutId);
+      beaconAbortController = null;
     }
-  } catch (err) {
-    console.error('[BrowserGuard] Beacon error:', err);
+  } finally {
+    beaconInFlight = false;
   }
 }
 
@@ -936,6 +1079,7 @@ export function __testGetState() {
     autoBeaconPaused,
     sessionInvalidated,
     consecutivePopupFailures,
+    beaconInFlight,
   };
 }
 
@@ -959,6 +1103,13 @@ export function __testResetStepUp(): void {
   sessionInvalidated = false;
   consecutivePopupFailures = 0;
   lastPopupFailureAt = 0;
+  // Reset in-flight beacon state (audit v0.2.1) — a previous test may
+  // have left beaconInFlight=true if the fetch mock never resolved.
+  beaconInFlight = false;
+  if (beaconAbortController) {
+    beaconAbortController.abort();
+    beaconAbortController = null;
+  }
 }
 
 // ─── Lifecycle ──────────────────────────────────────────────────────
