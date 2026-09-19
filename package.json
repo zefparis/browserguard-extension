@@ -10,7 +10,8 @@
     "dev": "node scripts/build.js --watch",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "smoke:stepup": "node scripts/smoke-stepup.mjs"
   },
   "devDependencies": {
     "@types/chrome": "^0.0.287",
