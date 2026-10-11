@@ -359,7 +359,6 @@ export function flush(): void {
     chrome.runtime.sendMessage({
       type: 'browserguard_behavior_snapshot',
       snapshot,
-      url: window.location.href,
       timestamp: Date.now(),
     });
   } catch {
