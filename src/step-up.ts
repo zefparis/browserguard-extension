@@ -6,17 +6,17 @@
  * and relays the postMessage result back to the background service worker
  * via chrome.runtime.sendMessage.
  *
- * Flow:
- *   1. Read query params: sessionId, tenantId, callbackOrigin, stepUpUrl
- *   2. Build the GateGuard embed URL with callbackOrigin=chrome-extension://<id>
- *   3. Load the iframe
- *   4. Listen for window.message events from the iframe
- *   5. Relay result to background.ts via chrome.runtime.sendMessage
- *   6. Auto-close the window
+ * Verdict (Phase 6b): after the iframe result is relayed, the page WAITS
+ * for the service worker's response — which carries the SERVER decision
+ * (accepted/rejected by /step-up-result) — before showing "validée" or
+ * "non validée". 8s deadline → neutral message; a server-rejected GO is
+ * NEVER shown as passed. postMessage/origin/proof logic is unchanged.
  *
  * @copyright (c) 2026 Benjamin BARRERE / IA SOLUTION
  * @license Patents Pending FR2514274 | FR2514546
  */
+
+import { t, detectLang } from './i18n';
 
 // Dev-build flag injected by esbuild `define` (false/absent in prod).
 declare const __BG_DEV__: boolean;
@@ -24,29 +24,63 @@ declare const __BG_DEV__: boolean;
 (function () {
   'use strict';
 
+  const lang = detectLang();
+  document.documentElement.lang = lang;
+
+  const VERDICT_WAIT_MS = 8_000;   // max wait for the SW/server verdict
+  const VERDICT_SHOW_MS = 3_000;   // how long the verdict stays visible
+
   const params = new URLSearchParams(window.location.search);
   const sessionId = params.get('sessionId') || '';
   const tenantId = params.get('tenantId') || '';
   const callbackOrigin = params.get('callbackOrigin') || '';
   const stepUpUrl = params.get('stepUpUrl') || '';
 
+  const loading = document.getElementById('loading')!;
+  const container = document.getElementById('iframe-container')!;
+  const iframe = document.getElementById('stepup-iframe') as HTMLIFrameElement;
+  const intro = document.getElementById('intro')!;
+  const verdictEl = document.getElementById('verdict')!;
+  const verdictIcon = document.getElementById('verdict-icon')!;
+  const verdictText = document.getElementById('verdict-text')!;
+  const verdictSub = document.getElementById('verdict-sub')!;
+
+  intro.textContent = t('stepup.intro', lang);
+  loading.textContent = t('stepup.loading', lang);
+
+  function showError(textKey: string, extra?: string): void {
+    loading.style.display = 'flex';
+    const div = document.createElement('div');
+    div.className = 'v-error';
+    div.textContent = t('stepup.error', lang) + t(textKey, lang) + (extra ? ' ' + extra : '');
+    loading.replaceChildren(div);
+    container.style.display = 'none';
+  }
+
+  // Verdict display — 'ok' | 'ko' | 'neutral'. Auto-closes after
+  // VERDICT_SHOW_MS; the user can always close the window manually.
+  function showVerdict(kind: 'ok' | 'ko' | 'neutral', textKey: string, subKey?: string): void {
+    iframe.src = 'about:blank';
+    container.style.display = 'none';
+    loading.style.display = 'none';
+    intro.style.display = 'none';
+    verdictEl.className = kind;
+    verdictEl.style.display = 'flex';
+    verdictIcon.textContent = kind === 'ok' ? '✓' : kind === 'ko' ? '✗' : '…';
+    verdictText.textContent = t(textKey, lang);
+    verdictSub.textContent = subKey ? t(subKey, lang) : '';
+    setTimeout(() => window.close(), VERDICT_SHOW_MS);
+  }
+
   if (!stepUpUrl) {
     console.error('[step-up] Missing stepUpUrl query param');
-    // Show visual error instead of silently closing
-    const loading = document.getElementById('loading');
-    if (loading) {
-      loading.innerHTML = '<div style="color:#ef4444;font-size:14px;text-align:center;padding:20px;">'
-        + 'Erreur: cette page ne peut pas être ouverte directement.<br>'
-        + 'Elle est appelée automatiquement par BrowserGuard lors d\'un step-up.'
-        + '</div>';
-    }
+    showError('stepup.no_direct');
     chrome.runtime.sendMessage({
       type: 'browserguard_stepup_error',
       error: 'missing_stepup_url',
       detail: 'stepUpUrl query param is required',
       sessionId,
     });
-    // Don't auto-close — let the user see the error
     return;
   }
 
@@ -64,10 +98,6 @@ declare const __BG_DEV__: boolean;
   const embedUrl = `${stepUpUrl}?${embedParams.toString()}`;
 
   // Load the iframe
-  const loading = document.getElementById('loading')!;
-  const container = document.getElementById('iframe-container')!;
-  const iframe = document.getElementById('stepup-iframe') as HTMLIFrameElement;
-
   iframe.src = embedUrl;
   loading.style.display = 'none';
   container.style.display = 'block';
@@ -76,12 +106,7 @@ declare const __BG_DEV__: boolean;
   // If the iframe fails to load (CSP, network, etc.), show a visible
   // error instead of a silent "broken image" icon.
   iframe.addEventListener('error', () => {
-    loading.style.display = 'flex';
-    loading.innerHTML = '<div style="color:#ef4444;font-size:13px;text-align:center;padding:20px;">'
-      + 'Erreur: impossible de charger le challenge.<br>'
-      + 'URL: ' + embedUrl
-      + '</div>';
-    container.style.display = 'none';
+    showError('stepup.iframe_failed');
     chrome.runtime.sendMessage({
       type: 'browserguard_stepup_error',
       error: 'iframe_load_failed',
@@ -96,12 +121,7 @@ declare const __BG_DEV__: boolean;
   iframe.addEventListener('load', () => { iframeLoaded = true; });
   setTimeout(() => {
     if (!iframeLoaded) {
-      loading.style.display = 'flex';
-      loading.innerHTML = '<div style="color:#ef4444;font-size:13px;text-align:center;padding:20px;">'
-        + 'Erreur: le challenge n\'a pas répondu dans les 10s.<br>'
-        + 'URL: ' + embedUrl
-        + '</div>';
-      container.style.display = 'none';
+      showError('stepup.iframe_timeout');
       chrome.runtime.sendMessage({
         type: 'browserguard_stepup_error',
         error: 'iframe_load_timeout',
@@ -131,6 +151,8 @@ declare const __BG_DEV__: boolean;
     TRUSTED_ORIGINS.add('http://localhost:7332');
   }
 
+  let verdictSettled = false;
+
   window.addEventListener('message', (event) => {
     // Reject messages from untrusted origins
     if (!TRUSTED_ORIGINS.has(event.origin)) return;
@@ -139,25 +161,46 @@ declare const __BG_DEV__: boolean;
 
     if (!data || typeof data !== 'object') return;
 
-    if (data.type === 'browserguard_stepup_result') {
-      // Relay to background service worker
+    if (data.type === 'browserguard_stepup_result' && !verdictSettled) {
+      verdictSettled = true;
+      // Relay to background service worker and WAIT for the server-side
+      // verdict: the SW answers {success, code} after /step-up-result.
       // SECURITY: proofToken is a signed attestation from GateGuard that
       // the cognitive challenge was really completed with a GO decision.
       // /step-up-result rejects GO without a valid proofToken.
-      chrome.runtime.sendMessage({
-        type: 'browserguard_stepup_result',
-        decision: data.decision,
-        score: data.score,
-        confidence: data.confidence,
-        engaged: data.engaged,
-        reason: data.reason,
-        sessionId: data.sessionId,
-        completedCount: data.completedCount,
-        plannedCount: data.plannedCount,
-        proofToken: data.proofToken || null,
-      });
-      // Auto-close after a short delay
-      setTimeout(() => window.close(), 500);
+      const deadline = setTimeout(() => {
+        showVerdict('neutral', 'stepup.pending');
+      }, VERDICT_WAIT_MS);
+
+      try {
+        chrome.runtime.sendMessage({
+          type: 'browserguard_stepup_result',
+          decision: data.decision,
+          score: data.score,
+          confidence: data.confidence,
+          engaged: data.engaged,
+          reason: data.reason,
+          sessionId: data.sessionId,
+          completedCount: data.completedCount,
+          plannedCount: data.plannedCount,
+          proofToken: data.proofToken || null,
+        }, (resp: { success?: boolean; code?: string } | undefined) => {
+          clearTimeout(deadline);
+          if (chrome.runtime.lastError || !resp) {
+            showVerdict('neutral', 'stepup.pending');
+            return;
+          }
+          // NEVER "validée" on a server reject — even if the iframe said GO.
+          if (resp.success === true) {
+            showVerdict('ok', 'stepup.success');
+          } else {
+            showVerdict('ko', 'stepup.failure', 'stepup.not_recorded');
+          }
+        });
+      } catch {
+        clearTimeout(deadline);
+        showVerdict('neutral', 'stepup.pending');
+      }
     }
 
     if (data.type === 'browserguard_stepup_error') {
@@ -174,6 +217,7 @@ declare const __BG_DEV__: boolean;
   // ─── Timeout: close if no result after 60s ────────────────────────
 
   setTimeout(() => {
+    if (verdictSettled) return; // verdict flow already owns the window
     chrome.runtime.sendMessage({
       type: 'browserguard_stepup_error',
       error: 'stepup_timeout',

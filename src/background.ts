@@ -21,6 +21,10 @@
  * @license Patents Pending FR2514274 | FR2514546
  */
 
+import { STEP_UP_PAGE_PATH, POPUP_PAGE_PATH } from './page-paths.js';
+import { computeStatus, buildStatusResponse, type LastStepUpResult } from './status';
+import { tUi } from './i18n-ui';
+
 // Service worker context detection: chrome.runtime is only defined in the
 // actual extension SW. In vitest, chrome.* is mocked but chrome.runtime.id
 // is not set (or set to a test sentinel). This guard prevents the lifecycle
@@ -134,6 +138,7 @@ export async function refreshIngestKey(force = false): Promise<string | null> {
 // the "tabs" permission (only tab.id is used — a non-sensitive field).
 export async function broadcastCollectionState(): Promise<void> {
   const key = await refreshIngestKey(true); // force re-read — policy just changed
+  updateActionBadge();
   const msg = { type: 'browserguard_collection_state', enabled: !!key };
   chrome.tabs.query({}, (tabs) => {
     for (const tab of tabs) {
@@ -318,6 +323,88 @@ let lastPopupFailureAt: number = 0;
 const POPUP_FAILURE_THRESHOLD = 3;
 const POPUP_FAILURE_BACKOFF_MS = 120_000;
 
+// ── Status model (Phase 6b) ─────────────────────────────────────────
+// These feed computeStatus() (badge) and the sanitized status response
+// sent to the dev popup. consecutiveBeaconFailures counts ONLY fetches
+// that actually left the browser and failed — skipped sends (no key,
+// backoff, no snapshot, step-up in progress, invalidated) never count.
+let lastBeaconOkAt = 0;               // 0 = no beacon accepted yet
+let consecutiveBeaconFailures = 0;
+let stepUpRequiredPending = false;    // server required a step-up (see resets)
+let lastStepUpResult: LastStepUpResult | null = null;
+const LAST_STEPUP_RESULT_KEY = 'browserguard_lastStepUpResult';
+const LAST_BEACON_OK_KEY = 'browserguard_lastBeaconOkAt';
+
+interface StatusSnapshot {
+  hasKey: boolean;
+  lastBeaconOkAt: number;
+  consecutiveBeaconFailures: number;
+  stepUpRequiredPending: boolean;
+  stepUpInProgress: boolean;
+  serverBackoffUntil: number;
+  sessionInvalidated: boolean;
+  now: number;
+}
+
+export function statusSnapshot(): StatusSnapshot {
+  return {
+    hasKey: !!ingestKey,
+    lastBeaconOkAt,
+    consecutiveBeaconFailures,
+    stepUpRequiredPending,
+    stepUpInProgress,
+    serverBackoffUntil,
+    sessionInvalidated,
+    now: Date.now(),
+  };
+}
+
+// Dev-only badge update — the __BG_DEV__ literal stays INLINE and the
+// dev condition wraps the whole body in an if-STATEMENT (not an early
+// return). An `if (false) {…}` is eliminated during parsing so esbuild
+// never even marks computeStatus/tUi as used: both are tree-shaken out
+// of production bundles. An early-return guard folds to `if(true)return`
+// and leaves the body in the AST — which is what leaked dev strings
+// into dist-publish before.
+export function updateActionBadge(): void {
+  if (typeof __BG_DEV__ !== 'undefined' && __BG_DEV__ === true && IS_DEV_BUILD && isServiceWorkerContext) {
+    try {
+      const v = computeStatus(statusSnapshot());
+      void chrome.action.setBadgeText({ text: v.badgeText });
+      void chrome.action.setBadgeBackgroundColor({ color: v.badgeColor });
+      void chrome.action.setTitle({ title: `BrowserGuard — ${tUi(v.titleKey)}` });
+    } catch { /* chrome.action unavailable */ }
+  }
+}
+
+function persistSessionStatus(): void {
+  try { chrome.storage?.session?.set({ [LAST_BEACON_OK_KEY]: lastBeaconOkAt }); } catch { /* ignore */ }
+}
+
+function persistLastStepUpResult(): void {
+  try { chrome.storage?.session?.set({ [LAST_STEPUP_RESULT_KEY]: lastStepUpResult }); } catch { /* ignore */ }
+}
+
+// Restore status fields from chrome.storage.session on SW startup —
+// survives SW sleep (memory only, never persisted to disk). Without it
+// a woken SW would show "connecting" to a user who is simply idle.
+export function restoreSessionStatus(): Promise<void> {
+  return new Promise<void>((resolve) => {
+    try {
+      const area = chrome.storage?.session;
+      if (!area?.get) { resolve(); return; }
+      area.get([LAST_STEPUP_RESULT_KEY, LAST_BEACON_OK_KEY], (r: Record<string, unknown>) => {
+        const ls = r?.[LAST_STEPUP_RESULT_KEY] as LastStepUpResult | undefined;
+        if (ls && typeof ls.at === 'number') lastStepUpResult = ls;
+        const lb = r?.[LAST_BEACON_OK_KEY];
+        if (typeof lb === 'number') lastBeaconOkAt = lb;
+        updateActionBadge();
+        resolve();
+      });
+    } catch { resolve(); }
+  });
+}
+
 // Safety timeout: if no result/error is received within 90s, force-reset
 // stepUpInProgress so future beacons can trigger a new step-up.
 // 90s > 60s (step-up.ts timeout) to let the normal close flow happen first.
@@ -365,6 +452,7 @@ function clearBeaconAlarm(): void {
 function clearStepUpState(): void {
   stepUpInProgress = false;
   stepUpWindowId = null;
+  stepUpRequiredPending = false; // no pending step-up survives this reset
   if (stepUpSafetyTimer) {
     clearTimeout(stepUpSafetyTimer);
     stepUpSafetyTimer = null;
@@ -372,6 +460,7 @@ function clearStepUpState(): void {
   if (isServiceWorkerContext) {
     chrome.storage.local.remove(STEP_UP_STATE_KEY);
   }
+  updateActionBadge();
 }
 
 function persistStepUpState(): void {
@@ -763,6 +852,9 @@ export async function sendBeacon(): Promise<void> {
       }
 
       if (!resp.ok) {
+        // A fetch actually left the browser and was rejected — count it
+        // (skipped sends never reach here). ≥3 → error badge.
+        consecutiveBeaconFailures++;
         const code = errData?.error;
         if (resp.status === 403 && code === 'BROWSERGUARD_AUTH_FAILED') {
           // Key rejected (revoked/unknown/tenant inactive). Drop the cache
@@ -794,11 +886,16 @@ export async function sendBeacon(): Promise<void> {
         return;
       }
 
-      // A successful response clears the backoff and the one-shot
-      // tenant-mismatch rotation flag.
+      // A successful response clears the backoff, the failure counter
+      // and the one-shot tenant-mismatch rotation flag. It also marks
+      // "server reachable" for the status badge (persisted to
+      // storage.session so a SW restart doesn't regress to connecting).
       serverBackoffUntil = 0;
       serverBackoffStep = 0;
       tenantMismatchRotated = false;
+      consecutiveBeaconFailures = 0;
+      lastBeaconOkAt = Date.now();
+      persistSessionStatus();
 
       const data: BackendResponse = await resp.json();
       console.info('[BrowserGuard] Beacon response:', JSON.stringify({
@@ -823,6 +920,7 @@ export async function sendBeacon(): Promise<void> {
       // restarts the beacon cycle.
       if (data.invalidated === true) {
         sessionInvalidated = true;
+        stepUpRequiredPending = false; // no step-up on a dead session
         if (beaconTimer) {
           clearInterval(beaconTimer);
           beaconTimer = null;
@@ -834,9 +932,13 @@ export async function sendBeacon(): Promise<void> {
         return;
       }
 
-      // Check for step-up requirement
+      // Check for step-up requirement. stepUpRequiredPending drives the
+      // orange badge — every path that does NOT open a popup resets it
+      // so the badge never stays orange without a real pending step-up.
+      if (data.step_up_required === true) stepUpRequiredPending = true;
       if (data.step_up_required === true && data.step_up_url && !stepUpInProgress) {
         if (Date.now() < stepUpRejectedUntil) {
+          stepUpRequiredPending = false;
           // Phase 6: a step-up-result was rejected <60s ago. The server
           // cooldown is only set on ACCEPTED results — without this guard
           // every 5s beacon would re-open the popup in a loop. (Limitation:
@@ -852,6 +954,7 @@ export async function sendBeacon(): Promise<void> {
           consecutivePopupFailures >= POPUP_FAILURE_THRESHOLD &&
           (Date.now() - lastPopupFailureAt) < POPUP_FAILURE_BACKOFF_MS
         ) {
+          stepUpRequiredPending = false;
           const remaining = Math.ceil((POPUP_FAILURE_BACKOFF_MS - (Date.now() - lastPopupFailureAt)) / 1000);
           console.warn(`[BrowserGuard] Step-up required but skipping popup — ${consecutivePopupFailures} consecutive open failures, local backoff ${remaining}s remaining`);
         } else {
@@ -859,11 +962,14 @@ export async function sendBeacon(): Promise<void> {
           triggerStepUp(data.step_up_url);
         }
       } else if (data.step_up_required === true && !data.step_up_url) {
+        stepUpRequiredPending = false;
         console.warn('[BrowserGuard] Step-up required but no step_up_url in response');
       } else if (data.step_up_required === true && stepUpInProgress) {
         console.debug('[BrowserGuard] Step-up required but already in progress, skipping');
       }
     } catch (err) {
+      // The fetch left the browser (or tried to) and threw — count it.
+      consecutiveBeaconFailures++;
       // AbortError is expected when the 10s timeout fires — log at debug
       // level to avoid spamming the console during a backend outage.
       if (err instanceof DOMException && err.name === 'AbortError') {
@@ -877,6 +983,7 @@ export async function sendBeacon(): Promise<void> {
     }
   } finally {
     beaconInFlight = false;
+    updateActionBadge(); // recompute after every beacon attempt (dev only)
   }
 }
 
@@ -985,8 +1092,9 @@ export function triggerStepUp(stepUpUrl: string): void {
 
   stepUpInProgress = true;
 
-  // Build the step-up.html URL with query params
-  const extensionUrl = chrome.runtime.getURL('src/step-up.html');
+  // Build the step-up.html URL with query params — the path comes from
+  // the shared constant also used by the sender guard and build-dev.js.
+  const extensionUrl = chrome.runtime.getURL(STEP_UP_PAGE_PATH);
   const params = new URLSearchParams({
     sessionId,
     tenantId,
@@ -1093,7 +1201,14 @@ if (isServiceWorkerContext) {
 // and returns it as new_session_id. The extension switches to this new
 // sessionId for all subsequent beacons. The old sessionId is invalidated
 // server-side — any ping on it returns 403 SESSION_ROTATED with the new ID.
-export async function notifyStepUpEnd(sessionId: string, success: boolean, decision: string, score: number, confidence: number, proofToken?: string | null): Promise<void> {
+export interface StepUpNotifyResult {
+  sent: boolean;      // a request actually left the browser
+  accepted: boolean;  // the server answered 2xx
+  status?: number;
+  code?: string;      // server error code or 'NO_KEY' / 'NETWORK'
+}
+
+export async function notifyStepUpEnd(sessionId: string, success: boolean, decision: string, score: number, confidence: number, proofToken?: string | null): Promise<StepUpNotifyResult> {
   // Note: we do NOT await ensureInstallId() here — notifyStepUpEnd is called
   // fire-and-forget from several places (safety timer, window removed, error
   // handler). If installId isn't set yet, we send it as undefined (the backend
@@ -1105,7 +1220,7 @@ export async function notifyStepUpEnd(sessionId: string, success: boolean, decis
     const tenantKey = await refreshIngestKey();
     if (!tenantKey) {
       console.debug('[BrowserGuard] step-up-result not sent: no ingest key provisioned');
-      return;
+      return { sent: false, accepted: false, code: 'NO_KEY' };
     }
     const body: Record<string, unknown> = { sessionId, stepUpSuccess: success, decision, score, confidence, installId: installId || undefined };
     // SECURITY: Include proofToken for GO decisions — required by /step-up-result.
@@ -1148,7 +1263,7 @@ export async function notifyStepUpEnd(sessionId: string, success: boolean, decis
         recordServerBackoff(`step-up-result:${code}`);
       }
       console.warn(`[BrowserGuard] step-up-result rejected (${resp.status}${code ? ` ${code}` : ''}) — popup paused 60s`);
-      return;
+      return { sent: true, accepted: false, status: resp.status, code };
     }
 
     // ── Session rotation: switch to new sessionId on GO ──
@@ -1163,8 +1278,10 @@ export async function notifyStepUpEnd(sessionId: string, success: boolean, decis
       // Continue with the current sessionId (retrocompatible).
       console.debug('[BrowserGuard] Step-up-result response not JSON — no rotation (retrocompatible)');
     }
+    return { sent: true, accepted: true, status: resp.status };
   } catch (err) {
     console.error('[BrowserGuard] Failed to notify backend of step-up end:', err);
+    return { sent: false, accepted: false, code: 'NETWORK' };
   }
 }
 
@@ -1178,6 +1295,7 @@ function rotateSessionId(newSessionId: string): void {
   const oldSessionId = sessionId;
   sessionId = newSessionId;
   sessionInvalidated = false;
+  stepUpRequiredPending = false; // a rotated session carries no pending offer
   chrome.storage.local.set({ browserguard_sessionId: newSessionId });
   console.info(`[BrowserGuard] SessionId rotated: ${oldSessionId} → ${newSessionId} (persisted to storage)`);
 }
@@ -1194,11 +1312,16 @@ export function isStepUpSuccess(result: StepUpResultMessage): boolean {
   return false;
 }
 
-export async function handleStepUpResult(result: StepUpResultMessage): Promise<void> {
-  console.info('[BrowserGuard] Step-up result received:', result.decision, 'score=', result.score);
-  const success = isStepUpSuccess(result);
+export interface StepUpVerdict {
+  // success = iframe decision was GO-like AND the server ACCEPTED the
+  // step-up-result (2xx). A server-rejected GO is NEVER "passed".
+  success: boolean;
+  code?: string; // rejection code (internal use only — never displayed raw)
+}
 
-  // IMPORTANT: use the BrowserGuard sessionId (closure variable `sessionId`),
+export async function handleStepUpResult(result: StepUpResultMessage): Promise<StepUpVerdict> {
+  console.info('[BrowserGuard] Step-up result received:', result.decision, 'score=', result.score);
+  const decisionOk = isStepUpSuccess(result);
   // NOT result.sessionId. The popup relays currentSession.sessionId from the
   // GateGuard embed iframe (embed.js:351), which is the GateGuard-internal
   // session ID returned by /session/start — a different identifier than the
@@ -1207,9 +1330,16 @@ export async function handleStepUpResult(result: StepUpResultMessage): Promise<v
   // emaDivergence reset under an orphan Redis key (browserguard:behavior:session:<gg_...>)
   // that the beacons never read, making the cooldown and the state repair
   // completely inoperative (re-trigger loop on every ping, even after a GO).
-  await notifyStepUpEnd(sessionId, success, result.decision, result.score, result.confidence, result.proofToken);
+  const notify = await notifyStepUpEnd(sessionId, decisionOk, result.decision, result.score, result.confidence, result.proofToken);
+
+  // Verdict shown to the user = iframe decision AND server acceptance.
+  const success = decisionOk && notify.accepted;
+  lastStepUpResult = { at: Date.now(), success, decision: result.decision };
+  persistLastStepUpResult(); // storage.session — survives SW sleep
 
   clearStepUpState();
+  updateActionBadge();
+  return { success, code: notify.accepted ? undefined : (notify.code ?? 'NOT_ACCEPTED') };
 }
 
 // ─── Message listener ───────────────────────────────────────────────
@@ -1217,8 +1347,42 @@ export async function handleStepUpResult(result: StepUpResultMessage): Promise<v
 // (pas de Map par tabId). Voir README.md → "Limitation connue — snapshot
 // multi-onglet" pour le contexte et l'option de secours si besoin.
 
-export function onRuntimeMessage(message: any, _sender: any, sendResponse: any): boolean {
+// ─── Sender guard ───────────────────────────────────────────────────
+// runtime.onMessage fires for content scripts of THIS extension and for
+// our own extension pages. A content script runs on EVERY web page —
+// so browserguard_stepup_result (a trusted attestation channel) must
+// only be accepted from the step-up page itself, and queries/results
+// are restricted to the context that legitimately emits them.
+// sender.url always carries our query params — compare the PARSED
+// origin + pathname, never strict string equality.
+function senderExtensionPathname(sender: chrome.runtime.MessageSender | undefined): string | null {
+  try {
+    const u = new URL(sender?.url ?? '');
+    // Compare protocol+host+pathname — NOT u.origin: non-special schemes
+    // return 'null' for origin per the WHATWG URL spec (and would break
+    // under Node-based tests). host holds the extension id either way.
+    const isExt = u.protocol === 'chrome-extension:' && u.host === chrome.runtime.id;
+    return isExt ? u.pathname : null;
+  } catch {
+    return null;
+  }
+}
+
+export function onRuntimeMessage(message: any, sender: any, sendResponse: any): boolean {
+  const fromExtension = sender?.id === chrome.runtime.id;
+  const extPath = senderExtensionPathname(sender);
+  const fromStepUpPage = fromExtension && extPath === `/${STEP_UP_PAGE_PATH}`;
+  // A content script runs inside a web page: sender.tab.id is defined
+  // AND sender.url is NOT our extension origin.
+  const fromContentScript = fromExtension && sender?.tab?.id !== undefined && extPath === null;
+
+  const reject = (what: string): boolean => {
+    console.warn(`[BrowserGuard] Message ${what} rejected: unauthorized sender`);
+    return false;
+  };
+
   if (message.type === 'browserguard_collection_query') {
+    if (!fromContentScript) return reject(message.type);
     // Content script asks whether behavioral collection is allowed.
     // The key is checked SW-side only — content scripts never read it.
     // Async sendResponse: return true keeps the message channel open.
@@ -1226,20 +1390,44 @@ export function onRuntimeMessage(message: any, _sender: any, sendResponse: any):
     return true;
   }
 
+  // Dev-only status channel (popup exists only in dist-dev). The
+  // __BG_DEV__ literal stays INLINE so the handler, the sender check and
+  // the 'popup.html' string are all tree-shaken out of prod bundles.
+  if (typeof __BG_DEV__ !== 'undefined' && __BG_DEV__ === true && IS_DEV_BUILD &&
+      message.type === 'browserguard_status_query') {
+    const fromPopup = fromExtension && extPath === `/${POPUP_PAGE_PATH}`;
+    if (!fromPopup) return reject(message.type);
+    // Dev popup asks for the sanitized status — NEVER the key, never
+    // sessionId/installId, never raw server messages (reasonCode only).
+    void refreshIngestKey().then((k) => {
+      sendResponse(buildStatusResponse({
+        ...statusSnapshot(),
+        hasKey: !!k,
+        lastStepUpResult,
+        version: chrome.runtime.getManifest().version,
+      }));
+    });
+    return true;
+  }
+
   if (message.type === 'browserguard_behavior_snapshot') {
-    // Le dernier onglet à flusher écrase les données des autres. _sender
-    // (qui contient sender.tab.id) est intentionnellement ignoré pour
-    // l'instant — voir la limitation documentée ci-dessus.
+    if (!fromContentScript) return reject(message.type);
+    // Le dernier onglet à flusher écrase les données des autres —
+    // voir la limitation "snapshot multi-onglet" documentée ci-dessus.
     lastSnapshot = message.snapshot as BehaviorSnapshot;
     return false; // synchronous, no response needed
   }
 
   if (message.type === 'browserguard_stepup_result') {
-    handleStepUpResult(message as StepUpResultMessage);
-    return false;
+    if (!fromStepUpPage) return reject(message.type);
+    // Async verdict response — the step-up page waits for the SERVER
+    // decision (accepted/rejected) before showing pass/fail.
+    void handleStepUpResult(message as StepUpResultMessage).then((v) => sendResponse(v));
+    return true;
   }
 
   if (message.type === 'browserguard_stepup_error') {
+    if (!fromStepUpPage) return reject(message.type);
     const errMsg = message as StepUpErrorMessage;
     console.error('[BrowserGuard] Step-up error:', errMsg.error, errMsg.detail);
     // Notify backend so it sets a cooldown — otherwise the popup re-opens
@@ -1269,7 +1457,8 @@ export function handleKeyStorageChange(changes: Record<string, unknown>, area: s
       (typeof __BG_DEV__ !== 'undefined' && __BG_DEV__ === true && IS_DEV_BUILD &&
         area === 'local' && DEV_LOCAL_KEY_FIELD in changes)) {
     ingestKey = null; // force re-read at next refresh
-    void broadcastCollectionState();
+    stepUpRequiredPending = false; // a lost key cancels any pending offer
+    void broadcastCollectionState(); // refreshes key + recomputes badge
   }
 }
 
@@ -1301,6 +1490,10 @@ export function __testGetState() {
     serverBackoffStep,
     tenantMismatchRotated,
     stepUpRejectedUntil,
+    lastBeaconOkAt,
+    consecutiveBeaconFailures,
+    stepUpRequiredPending,
+    lastStepUpResult,
     isDevBuild: IS_DEV_BUILD,
   };
 }
@@ -1337,6 +1530,15 @@ export function __testSetInstallId(id: string): void {
   installId = id;
 }
 
+export function __testSetBeaconStats(okAt: number, failures: number): void {
+  lastBeaconOkAt = okAt;
+  consecutiveBeaconFailures = failures;
+}
+
+export function __testSetStepUpRequiredPending(v: boolean): void {
+  stepUpRequiredPending = v;
+}
+
 export function __testSetSnapshot(snap: BehaviorSnapshot | null): void {
   lastSnapshot = snap;
 }
@@ -1353,6 +1555,10 @@ export function __testResetStepUp(): void {
   serverBackoffStep = 0;
   tenantMismatchRotated = false;
   stepUpRejectedUntil = 0;
+  lastBeaconOkAt = 0;
+  consecutiveBeaconFailures = 0;
+  stepUpRequiredPending = false;
+  lastStepUpResult = null;
   // Reset in-flight beacon state (audit v0.2.1) — a previous test may
   // have left beaconInFlight=true if the fetch mock never resolved.
   beaconInFlight = false;
@@ -1475,6 +1681,11 @@ if (isServiceWorkerContext) {
   // setInterval. The alarm itself also calls sendBeacon directly.
   ensureBeaconAlarm();
   beaconTimer = setInterval(sendBeacon, BEACON_INTERVAL_MS);
+
+  // Restore status fields persisted in storage.session (last accepted
+  // beacon + last step-up verdict) and recompute the badge — otherwise a
+  // woken SW would show "connecting" to an idle-but-connected user.
+  void restoreSessionStatus();
 
   // Clean up on suspend (MV3 service workers can be killed).
   // We clear the setInterval but deliberately KEEP the chrome.alarm alive —

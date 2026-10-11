@@ -19,6 +19,7 @@ import { build } from 'esbuild';
 import { copyFileSync, mkdirSync, rmSync, readdirSync, existsSync, readFileSync, writeFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
+import { STEP_UP_PAGE_PATH, POPUP_PAGE_PATH } from '../src/page-paths.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = join(__dirname, '..');
@@ -42,6 +43,9 @@ const commonOptions = {
     __BG_API_BASE__: '"http://localhost:3001"',
     __BG_STEPUP_BASE__: '"http://localhost:7332"',
     __BG_DEV__: 'true',
+    // Privacy policy URL for the dev popup — empty by default (no link
+    // rendered). Override via BG_PRIVACY_URL env var.
+    __BG_PRIVACY_URL__: JSON.stringify(process.env.BG_PRIVACY_URL ?? ''),
   },
 };
 
@@ -50,6 +54,8 @@ const entryPoints = [
   { src: 'src/content-script.ts', out: 'src/content-script.js' },
   { src: 'src/background.ts',     out: 'src/background.js' },
   { src: 'src/step-up.ts',        out: 'src/step-up.js' },
+  // Dev-only: action popup (status page — never shipped in prod builds).
+  { src: 'src/popup.ts',          out: 'src/popup.js' },
 ];
 
 for (const { src, out } of entryPoints) {
@@ -63,7 +69,9 @@ for (const { src, out } of entryPoints) {
 
 // ── Copy static assets ──
 const assets = [
-  ['src/step-up.html', 'src/step-up.html'],
+  [STEP_UP_PAGE_PATH, STEP_UP_PAGE_PATH],
+  // Dev-only: action popup page (same constant as default_popup below).
+  [POPUP_PAGE_PATH, POPUP_PAGE_PATH],
   // Dev-only: managed storage schema for chrome.storage.managed
   // (provisioned by the Chrome policy in cogsign-local/chrome-policy/).
   ['managed_schema.json', 'managed_schema.json'],
@@ -97,6 +105,11 @@ manifest.content_security_policy = {
 
 // Dev-only: chrome.storage.managed schema (policy-provisioned ingest key)
 manifest.storage = { managed_schema: 'managed_schema.json' };
+
+// Dev-only: status popup on the toolbar action. The source manifest is
+// NEVER modified — this only lands in dist-dev/manifest.json. Path comes
+// from the shared constant also used by the SW sender guard.
+manifest.action = { ...(manifest.action || {}), default_popup: POPUP_PAGE_PATH };
 
 writeFileSync(join(dist, 'manifest.json'), JSON.stringify(manifest, null, 2) + '\n');
 console.log('[build:dev] manifest.json → dist-dev/manifest.json (localhost + managed_schema, key kept)');

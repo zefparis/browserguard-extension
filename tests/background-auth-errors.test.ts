@@ -21,6 +21,14 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import bgSource from '../src/background.ts?raw';
 import csSource from '../src/content-script.ts?raw';
 
+// Sender emulating a real content script (extension id + web page URL +
+// tab.id) — required by the Phase 6b sender guard.
+const CS_SENDER = {
+  id: 'vitest-test-extension',
+  tab: { id: 42 },
+  url: 'https://example.com/page',
+};
+
 import {
   resetChromeMock,
   setupWindowsCreate,
@@ -368,7 +376,7 @@ describe('collection gate (SANS CLE = RIEN)', () => {
   it('browserguard_collection_query answers true when a key exists', async () => {
     __testSetIngestKey(TEST_KEY);
     const sendResponse = vi.fn();
-    const keepAlive = onRuntimeMessage({ type: 'browserguard_collection_query' }, {}, sendResponse);
+    const keepAlive = onRuntimeMessage({ type: 'browserguard_collection_query' }, CS_SENDER, sendResponse);
     expect(keepAlive).toBe(true); // async response
     await new Promise((r) => setTimeout(r, 20));
     expect(sendResponse).toHaveBeenCalledWith({ collectionEnabled: true });
@@ -376,7 +384,7 @@ describe('collection gate (SANS CLE = RIEN)', () => {
 
   it('browserguard_collection_query answers false without a key', async () => {
     const sendResponse = vi.fn();
-    onRuntimeMessage({ type: 'browserguard_collection_query' }, {}, sendResponse);
+    onRuntimeMessage({ type: 'browserguard_collection_query' }, CS_SENDER, sendResponse);
     await new Promise((r) => setTimeout(r, 20));
     expect(sendResponse).toHaveBeenCalledWith({ collectionEnabled: false });
   });

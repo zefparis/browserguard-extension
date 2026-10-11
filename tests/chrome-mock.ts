@@ -122,6 +122,7 @@ const tabs = {
 
 const storageData: Record<string, any> = {};
 const managedData: Record<string, any> = {};
+const sessionData: Record<string, any> = {};
 
 function storageArea(data: Record<string, any>) {
   return {
@@ -148,7 +149,26 @@ function storageArea(data: Record<string, any>) {
 const storage = {
   local: storageArea(storageData),
   managed: storageArea(managedData),
+  // chrome.storage.session — in-memory area, no extra permission beyond
+  // "storage". Survives SW sleep, cleared on browser restart.
+  session: storageArea(sessionData),
   onChanged: new MockEvent<[Record<string, { oldValue?: any; newValue?: any }>, string]>(),
+};
+
+// ─── chrome.action ──────────────────────────────────────────────────
+// Badge/title APIs need no permission when "action" is declared in the
+// manifest (which it already is). The mock records every call.
+
+const actionCalls = {
+  badgeText: [] as { text: string }[],
+  badgeColor: [] as { color: string }[],
+  title: [] as { title: string }[],
+};
+
+const action = {
+  setBadgeText: (details: { text: string }) => { actionCalls.badgeText.push(details); return Promise.resolve(); },
+  setBadgeBackgroundColor: (details: { color: string }) => { actionCalls.badgeColor.push(details); return Promise.resolve(); },
+  setTitle: (details: { title: string }) => { actionCalls.title.push(details); return Promise.resolve(); },
 };
 
 // ─── chrome.alarms ──────────────────────────────────────────────────
@@ -193,6 +213,7 @@ const chromeMock = {
   storage,
   alarms,
   tabs,
+  action,
 };
 
 // Expose on globalThis so `typeof chrome !== 'undefined'` is true in tests
@@ -211,6 +232,10 @@ export function resetChromeMock(): void {
   alarmsStore.clear();
   for (const k of Object.keys(storageData)) delete storageData[k];
   for (const k of Object.keys(managedData)) delete managedData[k];
+  for (const k of Object.keys(sessionData)) delete sessionData[k];
+  actionCalls.badgeText.length = 0;
+  actionCalls.badgeColor.length = 0;
+  actionCalls.title.length = 0;
   storage.onChanged = new MockEvent();
   tabsState.tabs = [];
   tabsState.sendMessageCalls = [];
@@ -223,6 +248,18 @@ export function setStorageData(key: string, value: any): void {
 
 export function setManagedData(key: string, value: any): void {
   managedData[key] = value;
+}
+
+export function setSessionData(key: string, value: any): void {
+  sessionData[key] = value;
+}
+
+export function getSessionData(): Record<string, any> {
+  return sessionData;
+}
+
+export function getActionCalls() {
+  return actionCalls;
 }
 
 export function getStorageOnChanged(): MockEvent<[Record<string, { oldValue?: any; newValue?: any }>, string]> {

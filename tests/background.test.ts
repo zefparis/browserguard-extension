@@ -49,6 +49,12 @@ import {
 
 const BG_SESSION_ID = 'bg_1234567890_abcdefgh';
 const GG_SESSION_ID = 'gg_different_session_id';
+// Sender emulating the step-up extension page — required by the Phase 6b
+// sender guard (origin + pathname check, query params tolerated).
+const STEP_UP_SENDER = {
+  id: 'vitest-test-extension',
+  url: 'chrome-extension://vitest-test-extension/src/step-up.html?sessionId=x&stepUpUrl=y',
+};
 
 function makeStepUpResult(overrides: Partial<StepUpResultMessage> = {}): StepUpResultMessage {
   return {
@@ -145,7 +151,7 @@ describe('Zone 1 — notifyStepUpEnd uses BrowserGuard sessionId, never GateGuar
 
     onRuntimeMessage(
       { type: 'browserguard_stepup_error', error: 'test_error', detail: 'test', sessionId: GG_SESSION_ID },
-      {},
+      STEP_UP_SENDER,
       () => {},
     );
 
@@ -211,7 +217,7 @@ describe('Zone 1 — notifyStepUpEnd uses BrowserGuard sessionId, never GateGuar
     // Path 2: error
     onRuntimeMessage(
       { type: 'browserguard_stepup_error', error: 'e', detail: 'd', sessionId: GG_SESSION_ID },
-      {},
+      STEP_UP_SENDER,
       () => {},
     );
     await new Promise((r) => setTimeout(r, 10));
