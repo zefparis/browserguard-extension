@@ -36,7 +36,15 @@ const commonOptions = {
   // on globalThis for manual testing from the SW DevTools console.
   // In production (build-publish.js), __DEBUG__ is false and the entire
   // debug block is tree-shaken out by esbuild.
-  define: { __DEBUG__: 'true' },
+  // __BG_*: build-time endpoints. Production literals are the defaults —
+  // this build keeps production endpoints; only build-dev.js overrides
+  // them to localhost. __BG_DEV__ stays false here (no local fallback).
+  define: {
+    __DEBUG__: 'true',
+    __BG_API_BASE__: '"https://api.hcs-u7.org/hv"',
+    __BG_STEPUP_BASE__: '"https://challenge.hcs-u7.org"',
+    __BG_DEV__: 'false',
+  },
 };
 
 // ── Entry points ──

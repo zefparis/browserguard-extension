@@ -44,7 +44,15 @@ const commonOptions = {
   logLevel: 'info',
   minify: true,         // enables dead code elimination — removes the
                         // if (isServiceWorkerContext && false) debug block
-  define: { __DEBUG__: 'false' },
+  // __BG_* resolve to the production literals — the emitted bundle is
+  // byte-equivalent to the previous hardcoded constants (no localhost,
+  // no dev fallback; the IS_DEV_BUILD branch is dead code → tree-shaken).
+  define: {
+    __DEBUG__: 'false',
+    __BG_API_BASE__: '"https://api.hcs-u7.org/hv"',
+    __BG_STEPUP_BASE__: '"https://challenge.hcs-u7.org"',
+    __BG_DEV__: 'false',
+  },
   drop: ['console'],
 };
 

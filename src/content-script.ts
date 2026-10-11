@@ -12,7 +12,8 @@
  * @license Patents Pending FR2514274 | FR2514546
  */
 
-export {}; // make this a module (content scripts have no imports)
+// Named exports are used by vitest; esbuild bundles this entry point
+// into a standalone IIFE, so they have no runtime effect in production.
 
 // ─── Config ─────────────────────────────────────────────────────────
 
@@ -82,11 +83,21 @@ let mouseSpeeds: number[] = [];
 let mouseCurvatures: number[] = [];
 let scrollSpeeds: number[] = [];
 
+// ─── Collection gating (Phase 6 — SANS CLE = RIEN) ──────────────────
+// The content script NEVER reads the ingest key. It asks the service
+// worker whether collection is allowed (browserguard_collection_query)
+// and obeys browserguard_collection_state broadcasts pushed by the SW
+// when the provisioned key appears or disappears. Until enabled, NO
+// DOM listener is attached — nothing is captured, buffered, or sent.
+
+let collectionEnabled = false;
+let listenersAttached = false;
+
 // ─── Keystroke capture ──────────────────────────────────────────────
 
 let keyDownTime = 0;
 
-document.addEventListener('keydown', (e) => {
+const onKeydown = (e: KeyboardEvent) => {
   // SECURITY: reject synthetic events dispatched by the page via
   // dispatchEvent(). isTrusted is set by the browser and cannot be
   // forged — only real user-generated events have isTrusted=true.
@@ -94,9 +105,9 @@ document.addEventListener('keydown', (e) => {
   // content script can forge a "perfect human" behavioral profile.
   if (!e.isTrusted) return;
   keyDownTime = performance.now();
-}, { passive: true });
+};
 
-document.addEventListener('keyup', (e) => {
+const onKeyup = (e: KeyboardEvent) => {
   // SECURITY: reject synthetic events (see keydown handler above).
   if (!e.isTrusted) return;
   if (keyDownTime === 0) return;
@@ -104,22 +115,20 @@ document.addEventListener('keyup', (e) => {
   const holdDuration = now - keyDownTime;
 
   if (lastKeystrokeTime > 0) {
-    const interval = now - lastKeystrokeTime;
     if (keystrokes.length < MAX_EVENTS_PER_TYPE) {
       keystrokes.push({ timestamp: now, duration: holdDuration });
     }
-    // Track interval separately via the keystrokes array
   }
   lastKeystrokeTime = now;
   keyDownTime = 0;
-}, { passive: true });
+};
 
 // ─── Mouse capture ──────────────────────────────────────────────────
 
 let prevMouseMove: { x: number; y: number; t: number } | null = null;
 let prevPrevMouseMove: { x: number; y: number; t: number } | null = null;
 
-document.addEventListener('mousemove', (e) => {
+const onMousemove = (e: MouseEvent) => {
   // SECURITY: reject synthetic events (see keydown handler above).
   if (!e.isTrusted) return;
   const now = performance.now();
@@ -165,11 +174,11 @@ document.addEventListener('mousemove', (e) => {
   prevPrevMouseMove = prevMouseMove;
   prevMouseMove = { x: e.clientX, y: e.clientY, t: now };
   lastMouseTime = now;
-}, { passive: true });
+};
 
 // ─── Scroll capture ─────────────────────────────────────────────────
 
-document.addEventListener('scroll', (e) => {
+const onScroll = (e: Event) => {
   // SECURITY: reject synthetic events (see keydown handler above).
   if (!e.isTrusted) return;
   const now = performance.now();
@@ -195,7 +204,57 @@ document.addEventListener('scroll', (e) => {
 
   lastScrollY = sy;
   lastScrollTime = now;
-}, { passive: true });
+};
+
+// ─── Listener lifecycle (Phase 6) ───────────────────────────────────
+
+function resetAccumulators(): void {
+  keystrokes.length = 0;
+  mouseEvents.length = 0;
+  scrollEvents.length = 0;
+  mouseSpeeds = [];
+  mouseCurvatures = [];
+  scrollSpeeds = [];
+  mousePauseCount = 0;
+  scrollPauseCount = 0;
+  lastKeystrokeTime = 0;
+  lastScrollTime = 0;
+  lastScrollY = 0;
+  keyDownTime = 0;
+  prevMouseMove = null;
+  prevPrevMouseMove = null;
+}
+
+export function enableCollection(): void {
+  if (listenersAttached) return;
+  document.addEventListener('keydown', onKeydown, { passive: true });
+  document.addEventListener('keyup', onKeyup, { passive: true });
+  document.addEventListener('mousemove', onMousemove, { passive: true });
+  document.addEventListener('scroll', onScroll, { passive: true });
+  listenersAttached = true;
+  collectionEnabled = true;
+}
+
+export function disableCollection(): void {
+  if (!listenersAttached) return;
+  document.removeEventListener('keydown', onKeydown);
+  document.removeEventListener('keyup', onKeyup);
+  document.removeEventListener('mousemove', onMousemove);
+  document.removeEventListener('scroll', onScroll);
+  listenersAttached = false;
+  collectionEnabled = false;
+  resetAccumulators(); // drop any partial window
+}
+
+export function __testGetCollectionState(): { enabled: boolean; listenersAttached: boolean; keystrokes: number; mouseEvents: number; scrollEvents: number } {
+  return {
+    enabled: collectionEnabled,
+    listenersAttached,
+    keystrokes: keystrokes.length,
+    mouseEvents: mouseEvents.length,
+    scrollEvents: scrollEvents.length,
+  };
+}
 
 // ─── Aggregate & flush ──────────────────────────────────────────────
 
@@ -289,7 +348,10 @@ function buildSnapshot(): BehaviorSnapshot {
   };
 }
 
-function flush(): void {
+export function flush(): void {
+  // SANS CLE = RIEN: no capture window while collection is disabled —
+  // don't even send an empty snapshot.
+  if (!collectionEnabled) return;
   const snapshot = buildSnapshot();
 
   // Send to service worker
@@ -309,34 +371,43 @@ function flush(): void {
   // causing keystrokes/mouseEvents/scrollEvents/scrollSpeeds/pauseCounts
   // to accumulate across windows — sending cumulative counts to the
   // server instead of per-window counts.
-  keystrokes.length = 0;
-  mouseEvents.length = 0;
-  scrollEvents.length = 0;
-  mouseSpeeds = [];
-  mouseCurvatures = [];
-  scrollSpeeds = [];
-  mousePauseCount = 0;
-  scrollPauseCount = 0;
-
-  // Reset tracking variables so the first event in the new window doesn't
-  // compute speed/interval/curvature relative to a stale point from the
-  // previous window (which would produce artificially low speeds or
-  // inflated intervals spanning the 5s gap).
-  lastKeystrokeTime = 0;
-  lastScrollTime = 0;
-  lastScrollY = 0;
-  prevMouseMove = null;
-  prevPrevMouseMove = null;
+  resetAccumulators();
 }
 
-// ─── Init ───────────────────────────────────────────────────────────
-
-// Flush periodically
-setInterval(flush, FLUSH_INTERVAL_MS);
-
-// Flush on page unload
-document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'hidden') {
-    flush();
+// ─── Init (page context only — skipped under vitest) ────────────────
+// The whole lifecycle is a function so tests can invoke it after
+// installing their own chrome/document stubs.
+export function initContentScript(): void {
+  // Ask the service worker whether collection is allowed. If the SW is
+  // dead or doesn't answer, stay disabled (fail closed — SANS CLE = RIEN).
+  try {
+    chrome.runtime.sendMessage({ type: 'browserguard_collection_query' }, (resp) => {
+      if (chrome.runtime.lastError) return; // SW unreachable — stay disabled
+      if (resp?.collectionEnabled) enableCollection();
+    });
+  } catch {
+    // SW unreachable — stay disabled
   }
-}, { passive: true });
+
+  // Obey state broadcasts from the SW when the key appears/disappears.
+  chrome.runtime.onMessage.addListener((msg) => {
+    if (msg?.type === 'browserguard_collection_state') {
+      if (msg.enabled) enableCollection();
+      else disableCollection();
+    }
+  });
+
+  // Flush periodically (no-op while collection is disabled)
+  setInterval(flush, FLUSH_INTERVAL_MS);
+
+  // Flush on page unload
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') {
+      flush();
+    }
+  }, { passive: true });
+}
+
+if (typeof document !== 'undefined' && typeof chrome !== 'undefined' && chrome.runtime?.id) {
+  initContentScript();
+}

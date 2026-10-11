@@ -52,6 +52,8 @@ const runtime = {
   lastError: undefined as chrome.runtime.LastError | undefined,
   getURL: (path: string): string => `chrome-extension://test-id/${path}`,
   onMessage: new MockEvent<[any, any, any]>(),
+  onStartup: new MockEvent<[]>(),
+  onInstalled: new MockEvent<[{ reason: string }?]>(),
   // getManifest — used by sendBeacon to include extVersion in the ping
   // payload (adoption tracking for the Worker-proxied step-up rollout).
   getManifest: (): { version: string } => ({ version: '0.2.0-test' }),
@@ -74,24 +76,79 @@ const windows = {
   }) as any,
 };
 
-// ─── chrome.storage.local ───────────────────────────────────────────
+// ─── chrome.tabs ────────────────────────────────────────────────────
+// tabs.query/tabs.sendMessage need no "tabs" permission (only tab.id is
+// used — a non-sensitive field). sendMessage delivers to content-script
+// onMessage listeners registered by tests; tabs without a listener set
+// lastError, like real Chrome.
+
+interface MockTab {
+  id?: number;
+  url?: string;
+}
+
+const tabsState = {
+  tabs: [] as MockTab[],
+  sendMessageCalls: [] as { tabId: number; message: any }[],
+  /** Listeners emulating content scripts, keyed by tabId. */
+  tabListeners: new Map<number, (msg: any) => void>(),
+};
+
+const tabs = {
+  query: (queryInfo: any, callback?: (tabs: MockTab[]) => void): Promise<MockTab[]> | void => {
+    const result = tabsState.tabs;
+    if (callback) {
+      setTimeout(() => callback(result), 0);
+      return;
+    }
+    return Promise.resolve(result);
+  },
+  sendMessage: (tabId: number, message: any, callback?: () => void): void => {
+    tabsState.sendMessageCalls.push({ tabId, message });
+    const listener = tabsState.tabListeners.get(tabId);
+    if (listener) {
+      listener(message);
+      runtime.lastError = undefined;
+    } else {
+      // Emulate "Could not establish connection" for tabs without a
+      // content script — broadcastCollectionState swallows lastError.
+      runtime.lastError = { message: 'Could not establish connection. Receiving end does not exist.' } as any;
+    }
+    if (callback) setTimeout(callback, 0);
+  },
+};
+
+// ─── chrome.storage.local / chrome.storage.managed ──────────────────
 
 const storageData: Record<string, any> = {};
+const managedData: Record<string, any> = {};
 
-const storage = {
-  local: {
-    get: (keys: string[], callback: (result: Record<string, any>) => void): void => {
+function storageArea(data: Record<string, any>) {
+  return {
+    get: (keys: string | string[], callback: (result: Record<string, any>) => void): void => {
+      const keyList = typeof keys === 'string' ? [keys] : keys;
       const result: Record<string, any> = {};
-      for (const k of keys) {
-        if (k in storageData) result[k] = storageData[k];
+      for (const k of keyList) {
+        if (k in data) result[k] = data[k];
       }
       // Simulate async callback
       setTimeout(() => callback(result), 0);
     },
     set: (items: Record<string, any>): void => {
-      Object.assign(storageData, items);
+      Object.assign(data, items);
     },
-  },
+    remove: (key: string | string[]): void => {
+      for (const k of typeof key === 'string' ? [key] : key) {
+        delete data[k];
+      }
+    },
+  };
+}
+
+const storage = {
+  local: storageArea(storageData),
+  managed: storageArea(managedData),
+  onChanged: new MockEvent<[Record<string, { oldValue?: any; newValue?: any }>, string]>(),
 };
 
 // ─── chrome.alarms ──────────────────────────────────────────────────
@@ -135,6 +192,7 @@ const chromeMock = {
   windows,
   storage,
   alarms,
+  tabs,
 };
 
 // Expose on globalThis so `typeof chrome !== 'undefined'` is true in tests
@@ -146,14 +204,33 @@ export function resetChromeMock(): void {
   runtime.id = 'vitest-test-extension';
   runtime.lastError = undefined;
   runtime.onMessage = new MockEvent();
+  runtime.onStartup = new MockEvent();
+  runtime.onInstalled = new MockEvent();
   windows.onRemoved = new MockEvent();
   alarms.onAlarm = new MockEvent();
   alarmsStore.clear();
   for (const k of Object.keys(storageData)) delete storageData[k];
+  for (const k of Object.keys(managedData)) delete managedData[k];
+  storage.onChanged = new MockEvent();
+  tabsState.tabs = [];
+  tabsState.sendMessageCalls = [];
+  tabsState.tabListeners.clear();
 }
 
 export function setStorageData(key: string, value: any): void {
   storageData[key] = value;
+}
+
+export function setManagedData(key: string, value: any): void {
+  managedData[key] = value;
+}
+
+export function getStorageOnChanged(): MockEvent<[Record<string, { oldValue?: any; newValue?: any }>, string]> {
+  return storage.onChanged;
+}
+
+export function getTabsState() {
+  return tabsState;
 }
 
 export function getWindowsOnRemoved(): MockEvent<[number]> {

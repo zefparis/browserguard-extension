@@ -48,8 +48,124 @@ if (isServiceWorkerContext && typeof chrome.alarms !== 'undefined') {
 // ─── Config ─────────────────────────────────────────────────────────
 
 const BEACON_INTERVAL_MS = 5_000; // ≥5s to stay under 20 req/min Worker rate limit
-const BACKEND_URL = 'https://api.hcs-u7.org/hv/api/browserguard/session-behavior-ping';
-const STEP_UP_URL_BASE = 'https://challenge.hcs-u7.org/embed/';
+
+// ─── Build-time configuration (Phase 6) ─────────────────────────────
+// esbuild `define` injects these per build flavor. All three builds
+// define them — production builds use the production literals, so the
+// emitted bundle folds to exactly the previous hardcoded values.
+// typeof-guards keep the module importable under vitest (no define).
+declare const __BG_API_BASE__: string;
+declare const __BG_STEPUP_BASE__: string;
+declare const __BG_DEV__: boolean;
+
+const API_BASE = typeof __BG_API_BASE__ === 'string' ? __BG_API_BASE__ : 'https://api.hcs-u7.org/hv';
+const STEP_UP_BASE = typeof __BG_STEPUP_BASE__ === 'string' ? __BG_STEPUP_BASE__ : 'https://challenge.hcs-u7.org';
+// Dev flag is mutable via __testSetDevBuild so tests can exercise both
+// the production path (no local fallback) and the dev fallback. Code that
+// must be TREE-SHAKEN out of production bundles (the storage.local key
+// fallback) is additionally gated on the `__BG_DEV__` literal INLINE in
+// the condition — esbuild folds `false && …` in prod and drops the
+// branch + its strings. (Do NOT extract the literal into a const —
+// esbuild does not propagate it far enough to kill the branch.)
+let IS_DEV_BUILD = typeof __BG_DEV__ !== 'undefined' && __BG_DEV__ === true;
+
+const BACKEND_URL = `${API_BASE}/api/browserguard/session-behavior-ping`;
+const STEP_UP_URL_BASE = `${STEP_UP_BASE}/embed/`;
+
+// ─── Tenant ingest key (Phase 6 — X-BrowserGuard-Key) ───────────────
+// The key is provisioned by the enterprise admin via Chrome policy
+// (chrome.storage.managed, schema declared in managed_schema.json).
+// It is NEVER bundled — a secret shipped in the package is public.
+// Dev builds only (IS_DEV_BUILD): fallback to chrome.storage.local
+// for manual testing without a policy install — tree-shaken in prod.
+//
+// SANS CLE = RIEN: when refreshIngestKey() returns null, sendBeacon()
+// and notifyStepUpEnd() return before any network call, and content
+// scripts are told (via broadcastCollectionState) not to capture.
+let ingestKey: string | null = null;
+let ingestKeyFetchedAt = 0;
+const INGEST_KEY_CACHE_MS = 60_000;
+const MANAGED_KEY_FIELD = 'ingestKey';
+const DEV_LOCAL_KEY_FIELD = 'browserguard_ingestKey';
+const MIN_INGEST_KEY_LENGTH = 32;
+
+function storageAreaGet(area: chrome.storage.StorageArea, key: string): Promise<Record<string, unknown>> {
+  return new Promise((resolve) => {
+    try {
+      area.get(key, (result: Record<string, unknown>) => resolve(result ?? {}));
+    } catch {
+      resolve({});
+    }
+  });
+}
+
+function isValidIngestKey(v: unknown): v is string {
+  return typeof v === 'string' && v.length >= MIN_INGEST_KEY_LENGTH;
+}
+
+export async function refreshIngestKey(force = false): Promise<string | null> {
+  if (!force && ingestKey && Date.now() - ingestKeyFetchedAt < INGEST_KEY_CACHE_MS) {
+    return ingestKey;
+  }
+  let key: string | null = null;
+  // chrome.storage.managed only exists when the manifest declares
+  // storage.managed_schema — absent in production builds for now.
+  if (chrome.storage?.managed) {
+    const m = await storageAreaGet(chrome.storage.managed, MANAGED_KEY_FIELD);
+    if (isValidIngestKey(m[MANAGED_KEY_FIELD])) key = m[MANAGED_KEY_FIELD];
+  }
+  // Dev-only fallback — the __BG_DEV__ literal must stay INLINE in the
+  // condition so esbuild removes this whole branch (and the
+  // 'browserguard_ingestKey' string) from prod bundles.
+  if (!key && typeof __BG_DEV__ !== 'undefined' && __BG_DEV__ === true && IS_DEV_BUILD) {
+    const l = await storageAreaGet(chrome.storage.local, DEV_LOCAL_KEY_FIELD);
+    if (isValidIngestKey(l[DEV_LOCAL_KEY_FIELD])) key = l[DEV_LOCAL_KEY_FIELD];
+  }
+  ingestKey = key;
+  ingestKeyFetchedAt = Date.now();
+  return key;
+}
+
+// ─── Collection gating broadcast (Phase 6) ──────────────────────────
+// Content scripts never read the key. On load they ask the SW whether
+// collection is allowed (browserguard_collection_query); the SW then
+// broadcasts browserguard_collection_state to all tabs whenever the
+// key appears or disappears. tabs.query/tabs.sendMessage do NOT require
+// the "tabs" permission (only tab.id is used — a non-sensitive field).
+export async function broadcastCollectionState(): Promise<void> {
+  const key = await refreshIngestKey(true); // force re-read — policy just changed
+  const msg = { type: 'browserguard_collection_state', enabled: !!key };
+  chrome.tabs.query({}, (tabs) => {
+    for (const tab of tabs) {
+      if (tab.id === undefined) continue;
+      chrome.tabs.sendMessage(tab.id, msg, () => {
+        // Tab without a content script (chrome://, new tab page) — expected.
+        void chrome.runtime.lastError;
+      });
+    }
+  });
+}
+
+// ─── Server-error backoff + step-up reject cooldown (Phase 6) ───────
+// 403 AUTH_FAILED / 500 TENANT_NOT_RESOLVED / 503 CHECK_UNAVAILABLE are
+// server-side rejects — retrying faster cannot help, and each retried
+// ping burns the server-side step-up offer budget (3/session). Exponential
+// backoff capped at 5 min; one warn per rejection, silent skips after.
+// After ANY rejected /step-up-result: ≥60s before another popup.
+let serverBackoffUntil = 0;
+let serverBackoffStep = 0;
+const SERVER_BACKOFF_BASE_MS = 5_000;
+const SERVER_BACKOFF_MAX_MS = 300_000;
+let tenantMismatchRotated = false;
+const STEP_UP_REJECT_COOLDOWN_MS = 60_000;
+let stepUpRejectedUntil = 0;
+
+function recordServerBackoff(reason: string): void {
+  const delay = Math.min(SERVER_BACKOFF_BASE_MS * 2 ** serverBackoffStep, SERVER_BACKOFF_MAX_MS);
+  serverBackoffStep = Math.min(serverBackoffStep + 1, 8);
+  serverBackoffUntil = Date.now() + delay;
+  console.warn(`[BrowserGuard] Server backoff ${Math.round(delay / 1000)}s — ${reason}`);
+}
 
 // ─── Beacon in-flight tracking + fetch timeout (audit v0.2.1) ───────
 // WITHOUT this guard, multiple sendBeacon() calls can overlap (setInterval
@@ -560,10 +676,25 @@ export async function sendBeacon(): Promise<void> {
       console.debug('[BrowserGuard] Beacon skipped: session invalidated');
       return;
     }
+    if (Date.now() < serverBackoffUntil) {
+      // A previous beacon/step-up-result was rejected server-side
+      // (AUTH_FAILED, TENANT_NOT_RESOLVED, …). Retrying now would only burn
+      // the step-up offer budget — skip silently until the backoff expires.
+      console.debug('[BrowserGuard] Beacon skipped: server backoff active');
+      return;
+    }
 
     await ensureSession();
     await ensureInstallId();
     await computeBundleHash();
+
+    // SANS CLE = RIEN (Phase 6): without a provisioned tenant ingest key,
+    // no beacon is sent at all — the server would 403 AUTH_FAILED anyway.
+    const tenantKey = await refreshIngestKey();
+    if (!tenantKey) {
+      console.debug('[BrowserGuard] Beacon skipped: no ingest key provisioned (chrome.storage.managed)');
+      return;
+    }
 
     const body = {
       sessionId,
@@ -593,64 +724,81 @@ export async function sendBeacon(): Promise<void> {
       beaconAbortController?.abort();
     }, BEACON_FETCH_TIMEOUT_MS);
 
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      'X-Source-App': 'browserguard',
+      'X-BrowserGuard-Key': tenantKey,
+    };
+
     try {
-      const resp = await fetch(BACKEND_URL, {
+      const doPing = (payload: typeof body) => fetch(BACKEND_URL, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Source-App': 'browserguard',
-        },
-        body: JSON.stringify(body),
-        signal: beaconAbortController.signal,
+        headers,
+        body: JSON.stringify(payload),
+        signal: beaconAbortController!.signal,
       });
 
+      let resp = await doPing(body);
+      let errData: { error?: string; new_session_id?: string } | null = null;
+
       if (!resp.ok) {
+        errData = await resp.json().catch(() => null);
         // ── Session rotation recovery (fallback) ──
-        // If the backend returns 403 SESSION_ROTATED, it means the current
-        // sessionId was rotated (after a step-up GO) but the extension didn't
-        // receive the new_session_id in the step-up-result response (network
-        // loss, SW restart, etc.). The backend includes the new sessionId in
-        // the error response — switch to it and retry the beacon.
-        if (resp.status === 403) {
-          try {
-            const errData = await resp.json();
-            if (errData.error === 'SESSION_ROTATED' && errData.new_session_id) {
-              console.info(`[BrowserGuard] Beacon rejected (SESSION_ROTATED) — switching to new sessionId: ${errData.new_session_id}`);
-              rotateSessionId(errData.new_session_id);
-              // Retry the beacon once with the new sessionId — don't loop
-              // (if the new sessionId is also rejected, the next 5s cycle
-              // will handle it normally). Reuse the same AbortController
-              // signal — the 10s timeout covers the total time including
-              // the retry.
-              const retryBody = { ...body, sessionId };
-              const retryResp = await fetch(BACKEND_URL, {
-                method: 'POST',
-                headers: {
-                  'Content-Type': 'application/json',
-                  'X-Source-App': 'browserguard',
-                },
-                body: JSON.stringify(retryBody),
-                signal: beaconAbortController.signal,
-              });
-              if (retryResp.ok) {
-                const retryData: BackendResponse = await retryResp.json();
-                console.info('[BrowserGuard] Beacon retry with rotated sessionId succeeded');
-                // Process the retry response normally (step-up check, invalidation, etc.)
-                // Fall through to the normal response handling below by reassigning.
-                // Note: we don't re-run the full response processing here to keep it
-                // simple — the next 5s beacon cycle will pick up any step-up requirement.
-                void retryData;
-              }
-              return;
-            }
-          } catch {
-            // Response wasn't JSON or didn't have the expected fields —
-            // fall through to the generic error log below.
+        // 403 SESSION_ROTATED means the current sessionId was rotated
+        // (step-up GO) but we missed the new_session_id. The backend
+        // includes it in the error — switch and retry the beacon ONCE.
+        // A retry that also fails goes through normal error classification
+        // below — there is never a second retry, never a loop.
+        if (resp.status === 403 && errData?.error === 'SESSION_ROTATED' && errData.new_session_id) {
+          console.info(`[BrowserGuard] Beacon rejected (SESSION_ROTATED) — switching to new sessionId: ${errData.new_session_id}`);
+          rotateSessionId(errData.new_session_id);
+          // Reuse the same AbortController signal — the 10s timeout
+          // covers the total time including this single retry.
+          resp = await doPing({ ...body, sessionId });
+          errData = resp.ok ? null : await resp.json().catch(() => null);
+          if (resp.ok) {
+            console.info('[BrowserGuard] Beacon retry with rotated sessionId succeeded');
           }
+        }
+      }
+
+      if (!resp.ok) {
+        const code = errData?.error;
+        if (resp.status === 403 && code === 'BROWSERGUARD_AUTH_FAILED') {
+          // Key rejected (revoked/unknown/tenant inactive). Drop the cache
+          // so the next attempt re-reads the policy, then back off — a
+          // wrong key never becomes right by retrying.
+          ingestKey = null;
+          recordServerBackoff('BROWSERGUARD_AUTH_FAILED');
+          return;
+        }
+        if (resp.status === 403 && code === 'BROWSERGUARD_TENANT_MISMATCH') {
+          // The session is bound to a different tenant. Regenerate the
+          // sessionId ONCE so the next cycle binds to this key's tenant —
+          // never more than once per error streak.
+          if (!tenantMismatchRotated) {
+            tenantMismatchRotated = true;
+            console.warn('[BrowserGuard] Session bound to another tenant — regenerating sessionId once');
+            rotateSessionId(generateSessionId());
+          }
+          recordServerBackoff('BROWSERGUARD_TENANT_MISMATCH');
+          return;
+        }
+        if (code === 'BROWSERGUARD_TENANT_NOT_RESOLVED' || code === 'BROWSERGUARD_TENANT_CHECK_UNAVAILABLE') {
+          // 500/503 — server couldn't resolve the tenant. Transient or
+          // misconfiguration; back off, no popup, no state changes.
+          recordServerBackoff(code!);
+          return;
         }
         console.error('[BrowserGuard] Beacon failed:', resp.status);
         return;
       }
+
+      // A successful response clears the backoff and the one-shot
+      // tenant-mismatch rotation flag.
+      serverBackoffUntil = 0;
+      serverBackoffStep = 0;
+      tenantMismatchRotated = false;
 
       const data: BackendResponse = await resp.json();
       console.info('[BrowserGuard] Beacon response:', JSON.stringify({
@@ -688,12 +836,19 @@ export async function sendBeacon(): Promise<void> {
 
       // Check for step-up requirement
       if (data.step_up_required === true && data.step_up_url && !stepUpInProgress) {
-        // Correctif 4: local backoff after consecutive popup open failures.
-        // If chrome.windows.create has failed 3+ times in the last 120s,
-        // skip the trigger to avoid spamming failed popup attempts. The
-        // backend cooldown (Correctif 1+2) is the primary protection; this
-        // is a defensive local net for when the backend doesn't cooperate.
-        if (
+        if (Date.now() < stepUpRejectedUntil) {
+          // Phase 6: a step-up-result was rejected <60s ago. The server
+          // cooldown is only set on ACCEPTED results — without this guard
+          // every 5s beacon would re-open the popup in a loop. (Limitation:
+          // each suppressed offer still decrements the server-side step-up
+          // budget — see README "Limites connues".)
+          console.debug('[BrowserGuard] Step-up required but a recent step-up-result was rejected — popup suppressed (60s guard)');
+        } else if (
+          // Correctif 4: local backoff after consecutive popup open failures.
+          // If chrome.windows.create has failed 3+ times in the last 120s,
+          // skip the trigger to avoid spamming failed popup attempts. The
+          // backend cooldown (Correctif 1+2) is the primary protection; this
+          // is a defensive local net for when the backend doesn't cooperate.
           consecutivePopupFailures >= POPUP_FAILURE_THRESHOLD &&
           (Date.now() - lastPopupFailureAt) < POPUP_FAILURE_BACKOFF_MS
         ) {
@@ -945,6 +1100,13 @@ export async function notifyStepUpEnd(sessionId: string, success: boolean, decis
   // schema marks it optional). sendBeacon ensures installId is populated on
   // the next 5s cycle, and subsequent step-up results will include it.
   try {
+    // SANS CLE = RIEN (Phase 6): no provisioned key → no request at all.
+    // The server would reject with AUTH_FAILED anyway.
+    const tenantKey = await refreshIngestKey();
+    if (!tenantKey) {
+      console.debug('[BrowserGuard] step-up-result not sent: no ingest key provisioned');
+      return;
+    }
     const body: Record<string, unknown> = { sessionId, stepUpSuccess: success, decision, score, confidence, installId: installId || undefined };
     // SECURITY: Include proofToken for GO decisions — required by /step-up-result.
     if (proofToken) {
@@ -955,24 +1117,51 @@ export async function notifyStepUpEnd(sessionId: string, success: boolean, decis
       headers: {
         'Content-Type': 'application/json',
         'X-Source-App': 'browserguard',
+        'X-BrowserGuard-Key': tenantKey,
       },
       body: JSON.stringify(body),
     });
     console.info(`[BrowserGuard] Step-up end notified to backend: success=${success} decision=${decision}`);
 
-    // ── Session rotation: switch to new sessionId on GO ──
-    if (resp.ok) {
-      try {
-        const data = await resp.json();
-        if (data.new_session_id && typeof data.new_session_id === 'string') {
-          console.info(`[BrowserGuard] Session rotated by backend: ${sessionId} → ${data.new_session_id}`);
-          rotateSessionId(data.new_session_id);
-        }
-      } catch (jsonErr) {
-        // Response wasn't JSON — backend may be older version without rotation.
-        // Continue with the current sessionId (retrocompatible).
-        console.debug('[BrowserGuard] Step-up-result response not JSON — no rotation (retrocompatible)');
+    if (!resp.ok) {
+      // A rejected step-up-result sets NO server-side cooldown — without
+      // this guard the next beacon gets step_up_required again and the
+      // popup re-opens in a loop. Minimum 60s between popups after ANY
+      // rejection.
+      stepUpRejectedUntil = Date.now() + STEP_UP_REJECT_COOLDOWN_MS;
+      const errData = await resp.json().catch(() => null) as { error?: string } | null;
+      const code = errData?.error;
+      if (code === 'BROWSERGUARD_SESSION_UNKNOWN') {
+        // Session dead server-side — the popup is already closed; start a
+        // fresh session bound to this key's tenant. The 60s guard above
+        // prevents any immediate popup re-trigger on the new session.
+        console.warn('[BrowserGuard] step-up-result rejected: session unknown — regenerating sessionId');
+        rotateSessionId(generateSessionId());
+      } else if (
+        code === 'BROWSERGUARD_AUTH_FAILED' || code === 'BROWSERGUARD_TENANT_MISMATCH' ||
+        code === 'BROWSERGUARD_TENANT_NOT_RESOLVED' || code === 'BROWSERGUARD_TENANT_CHECK_UNAVAILABLE'
+      ) {
+        // Same classification as the beacon path — drop the cached key so
+        // the policy is re-read, and back the BEACONS off so no further
+        // step-up offer budget is burned.
+        ingestKey = null;
+        recordServerBackoff(`step-up-result:${code}`);
       }
+      console.warn(`[BrowserGuard] step-up-result rejected (${resp.status}${code ? ` ${code}` : ''}) — popup paused 60s`);
+      return;
+    }
+
+    // ── Session rotation: switch to new sessionId on GO ──
+    try {
+      const data = await resp.json();
+      if (data.new_session_id && typeof data.new_session_id === 'string') {
+        console.info(`[BrowserGuard] Session rotated by backend: ${sessionId} → ${data.new_session_id}`);
+        rotateSessionId(data.new_session_id);
+      }
+    } catch (jsonErr) {
+      // Response wasn't JSON — backend may be older version without rotation.
+      // Continue with the current sessionId (retrocompatible).
+      console.debug('[BrowserGuard] Step-up-result response not JSON — no rotation (retrocompatible)');
     }
   } catch (err) {
     console.error('[BrowserGuard] Failed to notify backend of step-up end:', err);
@@ -1028,7 +1217,15 @@ export async function handleStepUpResult(result: StepUpResultMessage): Promise<v
 // (pas de Map par tabId). Voir README.md → "Limitation connue — snapshot
 // multi-onglet" pour le contexte et l'option de secours si besoin.
 
-export function onRuntimeMessage(message: any, _sender: any, _sendResponse: any): boolean {
+export function onRuntimeMessage(message: any, _sender: any, sendResponse: any): boolean {
+  if (message.type === 'browserguard_collection_query') {
+    // Content script asks whether behavioral collection is allowed.
+    // The key is checked SW-side only — content scripts never read it.
+    // Async sendResponse: return true keeps the message channel open.
+    void refreshIngestKey().then((k) => sendResponse({ collectionEnabled: !!k }));
+    return true;
+  }
+
   if (message.type === 'browserguard_behavior_snapshot') {
     // Le dernier onglet à flusher écrase les données des autres. _sender
     // (qui contient sender.tab.id) est intentionnellement ignoré pour
@@ -1063,6 +1260,25 @@ if (isServiceWorkerContext) {
   chrome.runtime.onMessage.addListener(onRuntimeMessage);
 }
 
+// ─── Key-change watchers (Phase 6) ──────────────────────────────────
+// Trigger broadcastCollectionState ONLY on these events — NOT on every
+// SW wake: freshly loaded content scripts already query the SW on load,
+// so a wake-time broadcast would be redundant work on every restart.
+export function handleKeyStorageChange(changes: Record<string, unknown>, area: string): void {
+  if ((area === 'managed' && MANAGED_KEY_FIELD in changes) ||
+      (typeof __BG_DEV__ !== 'undefined' && __BG_DEV__ === true && IS_DEV_BUILD &&
+        area === 'local' && DEV_LOCAL_KEY_FIELD in changes)) {
+    ingestKey = null; // force re-read at next refresh
+    void broadcastCollectionState();
+  }
+}
+
+if (isServiceWorkerContext) {
+  chrome.storage.onChanged.addListener(handleKeyStorageChange);
+  chrome.runtime.onStartup.addListener(() => void broadcastCollectionState());
+  chrome.runtime.onInstalled.addListener(() => void broadcastCollectionState());
+}
+
 // ─── Test helpers (exported, no runtime effect in production SW) ────
 // These let tests inspect and mutate the module-level state that the
 // service worker functions operate on. In production, esbuild strips the
@@ -1080,7 +1296,34 @@ export function __testGetState() {
     sessionInvalidated,
     consecutivePopupFailures,
     beaconInFlight,
+    ingestKey: ingestKey ? `***len${ingestKey.length}` : null,
+    serverBackoffUntil,
+    serverBackoffStep,
+    tenantMismatchRotated,
+    stepUpRejectedUntil,
+    isDevBuild: IS_DEV_BUILD,
   };
+}
+
+export function __testSetIngestKey(key: string | null): void {
+  ingestKey = key;
+  // Never expires: tests using vi.useFakeTimers() would otherwise see the
+  // cache go stale and block on the storage callback that fake timers
+  // never fire.
+  ingestKeyFetchedAt = Number.MAX_SAFE_INTEGER;
+}
+
+export function __testSetDevBuild(v: boolean): void {
+  IS_DEV_BUILD = v;
+}
+
+export function __testSetServerBackoff(untilMs: number, step: number): void {
+  serverBackoffUntil = untilMs;
+  serverBackoffStep = step;
+}
+
+export function __testSetStepUpRejected(untilMs: number): void {
+  stepUpRejectedUntil = untilMs;
 }
 
 export function __testSetSessionId(id: string): void {
@@ -1103,6 +1346,13 @@ export function __testResetStepUp(): void {
   sessionInvalidated = false;
   consecutivePopupFailures = 0;
   lastPopupFailureAt = 0;
+  // Reset Phase 6 key/backoff state so tests don't leak into each other.
+  ingestKey = null;
+  ingestKeyFetchedAt = 0;
+  serverBackoffUntil = 0;
+  serverBackoffStep = 0;
+  tenantMismatchRotated = false;
+  stepUpRejectedUntil = 0;
   // Reset in-flight beacon state (audit v0.2.1) — a previous test may
   // have left beaconInFlight=true if the fetch mock never resolved.
   beaconInFlight = false;

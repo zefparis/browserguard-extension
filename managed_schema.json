@@ -1,0 +1,11 @@
+{
+  "type": "object",
+  "properties": {
+    "ingestKey": {
+      "type": "string",
+      "title": "BrowserGuard ingest key",
+      "description": "Per-tenant ingest key (X-BrowserGuard-Key) provisioned by the enterprise administrator."
+    }
+  },
+  "additionalProperties": false
+}

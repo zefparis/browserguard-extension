@@ -18,6 +18,9 @@
  * @license Patents Pending FR2514274 | FR2514546
  */
 
+// Dev-build flag injected by esbuild `define` (false/absent in prod).
+declare const __BG_DEV__: boolean;
+
 (function () {
   'use strict';
 
@@ -120,6 +123,13 @@
     'https://challenge.hcs-u7.org',
     'https://api.hcs-u7.org',
   ]);
+
+  // Dev builds only (esbuild define __BG_DEV__): trust the local
+  // GateGuard origin for local manual testing. The literal is
+  // tree-shaken out of production bundles (__BG_DEV__ = false + minify).
+  if (typeof __BG_DEV__ !== 'undefined' && __BG_DEV__) {
+    TRUSTED_ORIGINS.add('http://localhost:7332');
+  }
 
   window.addEventListener('message', (event) => {
     // Reject messages from untrusted origins

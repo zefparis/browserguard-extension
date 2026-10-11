@@ -39,6 +39,7 @@ import {
   __testSetSessionId,
   __testSetInstallId,
   __testSetSnapshot,
+  __testSetIngestKey,
   __testResetStepUp,
   type StepUpResultMessage,
   type BehaviorSnapshot,
@@ -95,6 +96,9 @@ beforeEach(() => {
   __testSetInstallId('');
   __testSetSnapshot(makeSnapshot());
   __testResetStepUp();
+  // Phase 6: backend calls require a provisioned tenant ingest key —
+  // inject a fake one so these tests exercise the fetch paths as before.
+  __testSetIngestKey('a'.repeat(64));
   // Mock global fetch
   (globalThis as any).fetch = vi.fn();
 });
@@ -165,6 +169,9 @@ describe('Zone 1 — notifyStepUpEnd uses BrowserGuard sessionId, never GateGuar
 
     // Advance past the 90s safety timeout
     vi.advanceTimersByTime(91_000);
+    // notifyStepUpEnd is async (Phase 6: awaits the ingest key) — flush
+    // microtasks so the fetch call lands before we assert.
+    await vi.advanceTimersByTimeAsync(0);
 
     expect(fetch).toHaveBeenCalledTimes(1);
     const body = JSON.parse((fetch as any).mock.calls[0][1].body);
@@ -184,6 +191,8 @@ describe('Zone 1 — notifyStepUpEnd uses BrowserGuard sessionId, never GateGuar
 
     // Simulate popup closed without a result (stepUpInProgress still true)
     onStepUpWindowRemoved(1);
+    // notifyStepUpEnd is async (Phase 6: awaits the ingest key)
+    await new Promise((r) => setTimeout(r, 10));
 
     expect(fetch).toHaveBeenCalledTimes(1);
     const body = JSON.parse((fetch as any).mock.calls[0][1].body);
@@ -210,9 +219,11 @@ describe('Zone 1 — notifyStepUpEnd uses BrowserGuard sessionId, never GateGuar
 
     // Path 3: popup closed
     __testResetStepUp();
+    __testSetIngestKey('a'.repeat(64)); // reset clears the key — re-inject
     triggerStepUp('https://challenge.example.com/embed/');
     await new Promise((r) => setTimeout(r, 10));
     onStepUpWindowRemoved(1);
+    await new Promise((r) => setTimeout(r, 10)); // async notifyStepUpEnd
     const body3 = JSON.parse((fetch as any).mock.calls[2][1].body);
 
     expect(body1.sessionId).toBe(BG_SESSION_ID);
@@ -736,6 +747,7 @@ describe('Zone 6 — chrome.alarms safety net', () => {
     resetChromeMock();
     __testResetStepUp();
     __testSetSnapshot(makeSnapshot());
+    __testSetIngestKey('a'.repeat(64));
     (globalThis as any).fetch = vi.fn().mockResolvedValue({
       ok: true,
       json: () => Promise.resolve({ ok: true, step_up_required: false }),

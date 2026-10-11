@@ -42,6 +42,7 @@ import {
   __testSetSessionId,
   __testSetInstallId,
   __testSetSnapshot,
+  __testSetIngestKey,
   __testResetStepUp,
   detectPlatformFromUA,
   inferPlatformFromViewport,
@@ -111,6 +112,9 @@ beforeEach(() => {
   __testSetInstallId('bg_install_audit');
   __testSetSnapshot(makeSnapshot());
   __testResetStepUp();
+  // Phase 6: beacons require a provisioned tenant ingest key — inject a
+  // fake one so these tests exercise the network paths as before.
+  __testSetIngestKey('a'.repeat(64));
   (globalThis as any).fetch = vi.fn();
 });
 

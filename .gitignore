@@ -8,3 +8,4 @@ dist-publish/
 .env.local
 extension-key.pem
 extension-pubkey.b64
+dist-dev/
