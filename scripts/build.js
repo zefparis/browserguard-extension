@@ -52,6 +52,7 @@ const entryPoints = [
   { src: 'src/content-script.ts', out: 'src/content-script.js' },
   { src: 'src/background.ts',     out: 'src/background.js' },
   { src: 'src/step-up.ts',        out: 'src/step-up.js' },
+  { src: 'src/options.ts',        out: 'src/options.js' },
 ];
 
 // ── Build all entry points ──
@@ -68,6 +69,11 @@ for (const { src, out } of entryPoints) {
 const assets = [
   ['manifest.json', 'manifest.json'],
   ['src/step-up.html', 'src/step-up.html'],
+  ['src/options.html', 'src/options.html'],
+  // Managed storage schema — declares the ingestKey policy so
+  // chrome.storage.managed exists in ALL builds (policy wins over the
+  // options-page key).
+  ['managed_schema.json', 'managed_schema.json'],
 ];
 
 for (const [src, dest] of assets) {

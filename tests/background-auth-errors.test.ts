@@ -142,7 +142,7 @@ describe('SANS CLE = RIEN — no key, no activity', () => {
 
 // ─── 2. Key provisioning paths ──────────────────────────────────────
 
-describe('key provisioning — managed first, dev local fallback', () => {
+describe('key provisioning — managed first, local fallback', () => {
   it('reads the key from chrome.storage.managed', async () => {
     setManagedData('ingestKey', TEST_KEY);
     (globalThis as any).fetch.mockResolvedValue(okResponse());
@@ -150,7 +150,7 @@ describe('key provisioning — managed first, dev local fallback', () => {
     expect(lastFetchHeaders()['X-BrowserGuard-Key']).toBe(TEST_KEY);
   });
 
-  it('dev build falls back to chrome.storage.local', async () => {
+  it('falls back to chrome.storage.local (options page key)', async () => {
     setStorageData('browserguard_ingestKey', TEST_KEY);
     (globalThis as any).fetch.mockResolvedValue(okResponse());
     await sendBeacon();
@@ -158,7 +158,7 @@ describe('key provisioning — managed first, dev local fallback', () => {
     expect(lastFetchHeaders()['X-BrowserGuard-Key']).toBe(TEST_KEY);
   });
 
-  it('managed key wins over the dev local fallback', async () => {
+  it('managed key wins over the local fallback', async () => {
     const MANAGED = 'b'.repeat(64);
     setManagedData('ingestKey', MANAGED);
     setStorageData('browserguard_ingestKey', TEST_KEY);
@@ -167,11 +167,12 @@ describe('key provisioning — managed first, dev local fallback', () => {
     expect(lastFetchHeaders()['X-BrowserGuard-Key']).toBe(MANAGED);
   });
 
-  it('production path ignores the local fallback entirely', async () => {
+  it('local fallback also works on the production path', async () => {
     __testSetDevBuild(false);
     setStorageData('browserguard_ingestKey', TEST_KEY);
+    (globalThis as any).fetch.mockResolvedValue(okResponse());
     await sendBeacon();
-    expect(fetch).not.toHaveBeenCalled();
+    expect(lastFetchHeaders()['X-BrowserGuard-Key']).toBe(TEST_KEY);
   });
 
   it('rejects keys shorter than 32 chars', async () => {

@@ -56,6 +56,7 @@ const entryPoints = [
   { src: 'src/step-up.ts',        out: 'src/step-up.js' },
   // Dev-only: action popup (status page — never shipped in prod builds).
   { src: 'src/popup.ts',          out: 'src/popup.js' },
+  { src: 'src/options.ts',        out: 'src/options.js' },
 ];
 
 for (const { src, out } of entryPoints) {
@@ -72,6 +73,7 @@ const assets = [
   [STEP_UP_PAGE_PATH, STEP_UP_PAGE_PATH],
   // Dev-only: action popup page (same constant as default_popup below).
   [POPUP_PAGE_PATH, POPUP_PAGE_PATH],
+  ['src/options.html', 'src/options.html'],
   // Dev-only: managed storage schema for chrome.storage.managed
   // (provisioned by the Chrome policy in cogsign-local/chrome-policy/).
   ['managed_schema.json', 'managed_schema.json'],

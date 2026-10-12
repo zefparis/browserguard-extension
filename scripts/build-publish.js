@@ -60,6 +60,7 @@ const entryPoints = [
   { src: 'src/content-script.ts', out: 'src/content-script.js' },
   { src: 'src/background.ts',     out: 'src/background.js' },
   { src: 'src/step-up.ts',        out: 'src/step-up.js' },
+  { src: 'src/options.ts',        out: 'src/options.js' },
 ];
 
 // ── Build all entry points ──
@@ -75,6 +76,10 @@ for (const { src, out } of entryPoints) {
 // ── Copy static assets ──
 const assets = [
   ['src/step-up.html', 'src/step-up.html'],
+  ['src/options.html', 'src/options.html'],
+  // Managed storage schema — chrome.storage.managed needs it for the
+  // enterprise-policy ingestKey path in production builds too.
+  ['managed_schema.json', 'managed_schema.json'],
 ];
 
 for (const [src, dest] of assets) {

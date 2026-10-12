@@ -10,6 +10,15 @@
     "alarms"
   ],
 
+  "storage": {
+    "managed_schema": "managed_schema.json"
+  },
+
+  "options_ui": {
+    "page": "src/options.html",
+    "open_in_tab": true
+  },
+
   "host_permissions": [
     "https://api.hcs-u7.org/hv/*",
     "https://challenge.hcs-u7.org/*"

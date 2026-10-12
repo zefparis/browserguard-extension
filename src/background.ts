@@ -65,12 +65,11 @@ declare const __BG_DEV__: boolean;
 const API_BASE = typeof __BG_API_BASE__ === 'string' ? __BG_API_BASE__ : 'https://api.hcs-u7.org/hv';
 const STEP_UP_BASE = typeof __BG_STEPUP_BASE__ === 'string' ? __BG_STEPUP_BASE__ : 'https://challenge.hcs-u7.org';
 // Dev flag is mutable via __testSetDevBuild so tests can exercise both
-// the production path (no local fallback) and the dev fallback. Code that
-// must be TREE-SHAKEN out of production bundles (the storage.local key
-// fallback) is additionally gated on the `__BG_DEV__` literal INLINE in
-// the condition — esbuild folds `false && …` in prod and drops the
-// branch + its strings. (Do NOT extract the literal into a const —
-// esbuild does not propagate it far enough to kill the branch.)
+// build flavours. Code that must be TREE-SHAKEN out of production
+// bundles is gated on the `__BG_DEV__` literal INLINE in the condition —
+// esbuild folds `false && …` in prod and drops the branch + its strings.
+// (Do NOT extract the literal into a const — esbuild does not propagate
+// it far enough to kill the branch.)
 let IS_DEV_BUILD = typeof __BG_DEV__ !== 'undefined' && __BG_DEV__ === true;
 
 const BACKEND_URL = `${API_BASE}/api/browserguard/session-behavior-ping`;
@@ -78,10 +77,10 @@ const STEP_UP_URL_BASE = `${STEP_UP_BASE}/embed/`;
 
 // ─── Tenant ingest key (Phase 6 — X-BrowserGuard-Key) ───────────────
 // The key is provisioned by the enterprise admin via Chrome policy
-// (chrome.storage.managed, schema declared in managed_schema.json).
-// It is NEVER bundled — a secret shipped in the package is public.
-// Dev builds only (IS_DEV_BUILD): fallback to chrome.storage.local
-// for manual testing without a policy install — tree-shaken in prod.
+// (chrome.storage.managed, schema declared in managed_schema.json) OR
+// entered manually on the options page → chrome.storage.local
+// (never synced, never logged). It is NEVER bundled — a secret
+// shipped in the package is public. Policy wins over the local key.
 //
 // SANS CLE = RIEN: when refreshIngestKey() returns null, sendBeacon()
 // and notifyStepUpEnd() return before any network call, and content
@@ -90,7 +89,7 @@ let ingestKey: string | null = null;
 let ingestKeyFetchedAt = 0;
 const INGEST_KEY_CACHE_MS = 60_000;
 const MANAGED_KEY_FIELD = 'ingestKey';
-const DEV_LOCAL_KEY_FIELD = 'browserguard_ingestKey';
+const LOCAL_KEY_FIELD = 'browserguard_ingestKey';
 const MIN_INGEST_KEY_LENGTH = 32;
 
 function storageAreaGet(area: chrome.storage.StorageArea, key: string): Promise<Record<string, unknown>> {
@@ -118,12 +117,12 @@ export async function refreshIngestKey(force = false): Promise<string | null> {
     const m = await storageAreaGet(chrome.storage.managed, MANAGED_KEY_FIELD);
     if (isValidIngestKey(m[MANAGED_KEY_FIELD])) key = m[MANAGED_KEY_FIELD];
   }
-  // Dev-only fallback — the __BG_DEV__ literal must stay INLINE in the
-  // condition so esbuild removes this whole branch (and the
-  // 'browserguard_ingestKey' string) from prod bundles.
-  if (!key && typeof __BG_DEV__ !== 'undefined' && __BG_DEV__ === true && IS_DEV_BUILD) {
-    const l = await storageAreaGet(chrome.storage.local, DEV_LOCAL_KEY_FIELD);
-    if (isValidIngestKey(l[DEV_LOCAL_KEY_FIELD])) key = l[DEV_LOCAL_KEY_FIELD];
+  // Local fallback — key entered on the options page lives in
+  // chrome.storage.local (never synced, never logged). The key itself
+  // is still never bundled; only the field name ships.
+  if (!key) {
+    const l = await storageAreaGet(chrome.storage.local, LOCAL_KEY_FIELD);
+    if (isValidIngestKey(l[LOCAL_KEY_FIELD])) key = l[LOCAL_KEY_FIELD];
   }
   ingestKey = key;
   ingestKeyFetchedAt = Date.now();
@@ -1454,8 +1453,7 @@ if (isServiceWorkerContext) {
 // so a wake-time broadcast would be redundant work on every restart.
 export function handleKeyStorageChange(changes: Record<string, unknown>, area: string): void {
   if ((area === 'managed' && MANAGED_KEY_FIELD in changes) ||
-      (typeof __BG_DEV__ !== 'undefined' && __BG_DEV__ === true && IS_DEV_BUILD &&
-        area === 'local' && DEV_LOCAL_KEY_FIELD in changes)) {
+      (area === 'local' && LOCAL_KEY_FIELD in changes)) {
     ingestKey = null; // force re-read at next refresh
     stepUpRequiredPending = false; // a lost key cancels any pending offer
     void broadcastCollectionState(); // refreshes key + recomputes badge
