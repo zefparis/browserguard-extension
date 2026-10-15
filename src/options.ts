@@ -12,6 +12,7 @@
  */
 
 import { detectLang, type Lang } from './i18n';
+import { buildProofUrl, readDecisionHistory } from './proof-link';
 
 const FIELD = 'browserguard_ingestKey';
 const MIN_LEN = 32;
@@ -27,6 +28,8 @@ const STRINGS: Record<string, Record<Lang, string>> = {
   tooShort: { fr: 'Clé trop courte (32 caractères minimum).', en: 'Key too short (32 characters minimum).' },
   note:     { fr: 'La clé reste sur cet appareil (stockage local, jamais synchronisé).',
               en: 'The key stays on this device (local storage, never synced).' },
+  history:      { fr: 'Preuves de décisions récentes', en: 'Recent decision proofs' },
+  historyEmpty: { fr: 'Aucune décision enregistrée.', en: 'No recorded decision.' },
 };
 
 const lang: Lang = detectLang();
@@ -55,4 +58,46 @@ document.getElementById('save')!.addEventListener('click', () => {
 
 document.getElementById('clear')!.addEventListener('click', () => {
   chrome.storage.local.remove(FIELD, () => { show(s('cleared'), true); });
+});
+
+// ─── Decision proof history ─────────────────────────────────────────
+// Local history written by the service worker after each finalized
+// step-up (decisionId + outcome + timestamp only). Each row opens the
+// public proof page in a new tab via chrome.tabs.create.
+document.getElementById('history-title')!.textContent = s('history');
+
+function fmtTime(ts: number): string {
+  return new Date(ts).toLocaleTimeString(lang === 'fr' ? 'fr-FR' : 'en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+
+function renderHistory(): void {
+  void readDecisionHistory().then((entries) => {
+    const list = document.getElementById('history-list')!;
+    list.replaceChildren();
+    const empty = entries.length === 0;
+    document.getElementById('history-empty')!.textContent = empty ? s('historyEmpty') : '';
+    for (const e of entries) {
+      const url = buildProofUrl(e.decisionId);
+      if (!url) continue;
+      const li = document.createElement('li');
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      const time = document.createElement('span');
+      time.textContent = fmtTime(e.at);
+      const outcome = document.createElement('span');
+      outcome.className = 'outcome';
+      outcome.textContent = e.outcome;
+      btn.append(time, outcome);
+      btn.addEventListener('click', () => {
+        try { chrome.tabs.create({ url }); } catch { /* best effort */ }
+      });
+      li.append(btn);
+      list.append(li);
+    }
+  });
+}
+
+renderHistory();
+chrome.storage.onChanged.addListener((_changes, area) => {
+  if (area === 'local') renderHistory();
 });

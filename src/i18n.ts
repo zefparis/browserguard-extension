@@ -29,6 +29,7 @@ const STRINGS: Record<string, Record<Lang, string>> = {
   'stepup.iframe_failed': { fr: 'Impossible de charger le test.', en: 'Unable to load the challenge.' },
   'stepup.iframe_timeout': { fr: 'Le test n\'a pas répondu dans les 10 s.', en: 'The challenge did not respond within 10 s.' },
   'stepup.error':    { fr: 'Erreur : ', en: 'Error: ' },
+  'stepup.proof_link': { fr: 'Voir la preuve de cette décision', en: 'View the proof of this decision' },
 };
 
 export function detectLang(): Lang {

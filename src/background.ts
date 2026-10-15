@@ -24,6 +24,7 @@
 import { STEP_UP_PAGE_PATH, POPUP_PAGE_PATH } from './page-paths.js';
 import { computeStatus, buildStatusResponse, type LastStepUpResult } from './status';
 import { tUi } from './i18n-ui';
+import { isDecisionId, recordDecisionProof, readDecisionHistory } from './proof-link';
 
 // Service worker context detection: chrome.runtime is only defined in the
 // actual extension SW. In vitest, chrome.* is mocked but chrome.runtime.id
@@ -1331,6 +1332,19 @@ export async function handleStepUpResult(result: StepUpResultMessage): Promise<S
   // completely inoperative (re-trigger loop on every ping, even after a GO).
   const notify = await notifyStepUpEnd(sessionId, decisionOk, result.decision, result.score, result.confidence, result.proofToken);
 
+  // Proof history: result.sessionId is the GateGuard session UUID, which is
+  // also decision_receipts.decision_id (GateGuard /session/finalize sets
+  // decisionId = sessionId). A finalized decision gets an anchored receipt
+  // for GO and refusal alike, so it is recorded whatever the outcome.
+  // Fire-and-forget: bookkeeping must never delay the verdict response.
+  if (isDecisionId(result.sessionId)) {
+    void recordDecisionProof({
+      decisionId: result.sessionId,
+      outcome: result.decision,
+      at: Date.now(),
+    });
+  }
+
   // Verdict shown to the user = iframe decision AND server acceptance.
   const success = decisionOk && notify.accepted;
   lastStepUpResult = { at: Date.now(), success, decision: result.decision };
@@ -1398,12 +1412,15 @@ export function onRuntimeMessage(message: any, sender: any, sendResponse: any): 
     if (!fromPopup) return reject(message.type);
     // Dev popup asks for the sanitized status — NEVER the key, never
     // sessionId/installId, never raw server messages (reasonCode only).
-    void refreshIngestKey().then((k) => {
+    // decisionHistory carries only proof identifiers (public decision
+    // UUIDs + outcome + timestamp, see proof-link.ts privacy contract).
+    void Promise.all([refreshIngestKey(), readDecisionHistory()]).then(([k, decisions]) => {
       sendResponse(buildStatusResponse({
         ...statusSnapshot(),
         hasKey: !!k,
         lastStepUpResult,
         version: chrome.runtime.getManifest().version,
+        decisionHistory: decisions,
       }));
     });
     return true;

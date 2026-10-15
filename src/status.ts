@@ -86,6 +86,13 @@ export interface LastStepUpResult {
 // installId, no proofToken, no tenant identifier. Fields are
 // deliberately primitive (booleans, codes, timestamps, version string).
 
+/** One entry of the local proof history: public proof identifiers only. */
+export interface StatusDecisionEntry {
+  decisionId: string; // public GateGuard decision UUID (proof page id)
+  outcome: string;    // 'GO' | 'NO-GO' | 'INSUFFICIENT_CONFIDENCE' | …
+  at: number;         // epoch ms
+}
+
 export interface StatusResponse {
   level: StatusLevel;
   reasonCode: string;
@@ -95,11 +102,16 @@ export interface StatusResponse {
   lastStepUpSuccess: boolean | null;
   lastStepUpDecision: string | null;
   version: string;
+  // Public proof identifiers (decision UUID + outcome + timestamp). The
+  // decisionId is NOT a secret: /proof/:id is a public, rate-limited view
+  // exposing no identity data. No userId, tenant or page data.
+  decisionHistory: StatusDecisionEntry[];
 }
 
 export function buildStatusResponse(s: InternalState & {
   lastStepUpResult: LastStepUpResult | null;
   version: string;
+  decisionHistory?: StatusDecisionEntry[];
 }): StatusResponse {
   const view = computeStatus(s);
   return {
@@ -111,5 +123,6 @@ export function buildStatusResponse(s: InternalState & {
     lastStepUpSuccess: s.lastStepUpResult?.success ?? null,
     lastStepUpDecision: s.lastStepUpResult?.decision ?? null,
     version: s.version,
+    decisionHistory: s.decisionHistory ?? [],
   };
 }

@@ -41,6 +41,8 @@ const UI_STRINGS: Record<string, Record<Lang, string>> = {
     fr: 'Jamais collectés : touches pressées, contenu saisi, URL ou titre des pages, contenu des pages, historique de navigation.',
     en: 'Never collected: keys pressed, typed content, page URLs or titles, page content, browsing history.',
   },
+  'popup.history_title': { fr: 'Preuves de décisions', en: 'Decision proofs' },
+  'popup.history_empty': { fr: 'Aucune décision enregistrée', en: 'No recorded decision' },
   'popup.privacy':   { fr: 'Politique de confidentialité', en: 'Privacy policy' },
   'popup.version':   { fr: 'Version', en: 'Version' },
   'popup.unavailable': { fr: 'Statut indisponible — le service worker ne répond pas', en: 'Status unavailable — the service worker is not responding' },

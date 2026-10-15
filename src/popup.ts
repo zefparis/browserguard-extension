@@ -13,6 +13,7 @@
 
 import { detectLang, type Lang } from './i18n';
 import { tUi } from './i18n-ui';
+import { buildProofUrl } from './proof-link';
 import type { StatusResponse, StatusLevel } from './status';
 
 declare const __BG_PRIVACY_URL__: string;
@@ -53,6 +54,36 @@ function render(resp: StatusResponse): void {
   el('last-check').textContent = last;
 
   el('version-line').textContent = `${tUi('popup.version', lang)} ${resp.version}`;
+  renderHistory(resp.decisionHistory ?? []);
+}
+
+// Local proof history: decisionId + outcome + timestamp only. Each row
+// opens the public proof page in a new tab via chrome.tabs.create (no
+// "tabs" permission required for create).
+function renderHistory(entries: StatusResponse['decisionHistory']): void {
+  const list = el('history-list');
+  list.replaceChildren();
+  const empty = !entries || entries.length === 0;
+  el('history-empty').textContent = empty ? tUi('popup.history_empty', lang) : '';
+  if (empty) return;
+  for (const e of entries) {
+    const url = buildProofUrl(e.decisionId);
+    if (!url) continue;
+    const li = document.createElement('li');
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    const time = document.createElement('span');
+    time.textContent = fmtTime(e.at);
+    const outcome = document.createElement('span');
+    outcome.className = 'outcome';
+    outcome.textContent = e.outcome;
+    btn.append(time, outcome);
+    btn.addEventListener('click', () => {
+      try { chrome.tabs.create({ url }); } catch { /* best effort */ }
+    });
+    li.append(btn);
+    list.append(li);
+  }
 }
 
 function renderFallback(): void {
@@ -75,6 +106,7 @@ function init(): void {
   document.documentElement.lang = lang;
   el('status-label').textContent = tUi('popup.status_label', lang);
   el('last-check-label').textContent = tUi('popup.last_check', lang);
+  el('history-title').textContent = tUi('popup.history_title', lang);
   el('collected-title').textContent = tUi('popup.collected_title', lang);
   el('collected-items').textContent = tUi('popup.collected_items', lang);
   el('collected-never').textContent = tUi('popup.collected_never', lang);

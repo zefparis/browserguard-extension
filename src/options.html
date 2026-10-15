@@ -31,6 +31,19 @@
     #msg.ok { color: #4ade80; }
     #msg.err { color: #f87171; }
     .note { margin-top: 18px; color: #7dd3a8; font-size: 12px; line-height: 1.5; }
+    #history { margin-top: 28px; border-top: 1px solid #334155; padding-top: 14px; }
+    #history h2 { font-size: 13px; color: #cbd5e1; margin-bottom: 8px; }
+    #history-list { list-style: none; display: flex; flex-direction: column; gap: 4px; }
+    #history-list button {
+      display: flex; justify-content: space-between; gap: 8px; width: 100%;
+      padding: 6px 8px; border: none; border-radius: 4px;
+      background: #1e293b; color: #cbd5e1; font-size: 13px;
+      font-family: inherit; text-align: left; cursor: pointer;
+    }
+    #history-list button:hover { background: #273549; }
+    #history-list button:focus-visible { outline: 2px solid #38bdf8; outline-offset: 1px; }
+    #history-list .outcome { color: #94a3b8; font-family: ui-monospace, monospace; font-size: 12px; }
+    #history-empty { color: #64748b; font-size: 12px; }
   </style>
 </head>
 <body>
@@ -44,6 +57,12 @@
   </div>
   <div id="msg" role="status" aria-live="polite"></div>
   <p class="note" id="note"></p>
+
+  <div id="history">
+    <h2 id="history-title"></h2>
+    <ul id="history-list"></ul>
+    <div id="history-empty"></div>
+  </div>
   <script src="options.js"></script>
 </body>
 </html>

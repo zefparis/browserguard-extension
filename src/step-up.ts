@@ -17,6 +17,7 @@
  */
 
 import { t, detectLang } from './i18n';
+import { buildProofUrl } from './proof-link';
 
 // Dev-build flag injected by esbuild `define` (false/absent in prod).
 declare const __BG_DEV__: boolean;
@@ -44,6 +45,7 @@ declare const __BG_DEV__: boolean;
   const verdictIcon = document.getElementById('verdict-icon')!;
   const verdictText = document.getElementById('verdict-text')!;
   const verdictSub = document.getElementById('verdict-sub')!;
+  const verdictProof = document.getElementById('verdict-proof') as HTMLButtonElement;
 
   intro.textContent = t('stepup.intro', lang);
   loading.textContent = t('stepup.loading', lang);
@@ -57,8 +59,25 @@ declare const __BG_DEV__: boolean;
     container.style.display = 'none';
   }
 
+  // Proof link: set when the iframe posts a real finalized decision.
+  // data.sessionId in the postMessage is the GateGuard session UUID, which
+  // is also decision_receipts.decision_id (the /proof/?id= identifier).
+  // GO and refusal alike get an anchored receipt, so the link is shown for
+  // every verdict kind. When the link is present the window does NOT
+  // auto-close: the user needs time to click it (closes manually or opens
+  // the proof in a new tab via chrome.tabs.create).
+  let proofUrl: string | null = null;
+
+  verdictProof.addEventListener('click', () => {
+    if (!proofUrl) return;
+    try {
+      chrome.tabs.create({ url: proofUrl });
+    } catch { /* tab open is best effort */ }
+  });
+
   // Verdict display — 'ok' | 'ko' | 'neutral'. Auto-closes after
-  // VERDICT_SHOW_MS; the user can always close the window manually.
+  // VERDICT_SHOW_MS unless a proof link is shown; the user can always
+  // close the window manually.
   function showVerdict(kind: 'ok' | 'ko' | 'neutral', textKey: string, subKey?: string): void {
     iframe.src = 'about:blank';
     container.style.display = 'none';
@@ -69,7 +88,13 @@ declare const __BG_DEV__: boolean;
     verdictIcon.textContent = kind === 'ok' ? '✓' : kind === 'ko' ? '✗' : '…';
     verdictText.textContent = t(textKey, lang);
     verdictSub.textContent = subKey ? t(subKey, lang) : '';
-    setTimeout(() => window.close(), VERDICT_SHOW_MS);
+    if (proofUrl) {
+      verdictProof.textContent = t('stepup.proof_link', lang);
+      verdictProof.style.display = 'inline';
+    }
+    if (!proofUrl) {
+      setTimeout(() => window.close(), VERDICT_SHOW_MS);
+    }
   }
 
   if (!stepUpUrl) {
@@ -163,6 +188,9 @@ declare const __BG_DEV__: boolean;
 
     if (data.type === 'browserguard_stepup_result' && !verdictSettled) {
       verdictSettled = true;
+      // The GateGuard session UUID doubles as the public decisionId:
+      // buildProofUrl returns null for any non-UUID value.
+      proofUrl = buildProofUrl(data.sessionId);
       // Relay to background service worker and WAIT for the server-side
       // verdict: the SW answers {success, code} after /step-up-result.
       // SECURITY: proofToken is a signed attestation from GateGuard that

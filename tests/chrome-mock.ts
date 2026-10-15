@@ -90,11 +90,24 @@ interface MockTab {
 const tabsState = {
   tabs: [] as MockTab[],
   sendMessageCalls: [] as { tabId: number; message: any }[],
+  createCalls: [] as { url?: string }[],
   /** Listeners emulating content scripts, keyed by tabId. */
   tabListeners: new Map<number, (msg: any) => void>(),
 };
 
 const tabs = {
+  // tabs.create needs no "tabs" permission, used by step-up/options/popup
+  // pages to open the public proof link in a new tab.
+  create: (props: { url?: string }, callback?: (tab: MockTab) => void): Promise<MockTab> | void => {
+    tabsState.createCalls.push({ url: props?.url });
+    const tab: MockTab = { id: 10_000 + tabsState.createCalls.length, url: props?.url };
+    tabsState.tabs.push(tab);
+    if (callback) {
+      setTimeout(() => callback(tab), 0);
+      return;
+    }
+    return Promise.resolve(tab);
+  },
   query: (queryInfo: any, callback?: (tabs: MockTab[]) => void): Promise<MockTab[]> | void => {
     const result = tabsState.tabs;
     if (callback) {
@@ -239,6 +252,7 @@ export function resetChromeMock(): void {
   storage.onChanged = new MockEvent();
   tabsState.tabs = [];
   tabsState.sendMessageCalls = [];
+  tabsState.createCalls = [];
   tabsState.tabListeners.clear();
 }
 

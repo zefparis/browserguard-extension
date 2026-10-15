@@ -28,6 +28,21 @@
     }
     #collected h2 { font-size: 12px; color: #cbd5e1; margin-bottom: 4px; }
     #collected .never { margin-top: 6px; color: #7dd3a8; }
+    #history { border-top: 1px solid #334155; margin-top: 12px; padding-top: 10px; }
+    #history h2 { font-size: 12px; color: #cbd5e1; margin-bottom: 6px; }
+    #history-list { list-style: none; display: flex; flex-direction: column; gap: 4px; }
+    #history-list button {
+      display: flex; justify-content: space-between; gap: 8px; width: 100%;
+      padding: 4px 6px; border: none; border-radius: 4px;
+      background: #1e293b; color: #cbd5e1; font-size: 12px;
+      font-family: inherit; text-align: left; cursor: pointer;
+    }
+    #history-list button:hover { background: #273549; }
+    #history-list button:focus-visible {
+      outline: 2px solid #7dd3fc; outline-offset: 1px;
+    }
+    #history-list .outcome { color: #94a3b8; }
+    #history-empty { color: #64748b; font-size: 12px; }
     a { color: #7dd3fc; }
     a:focus-visible, [tabindex]:focus-visible {
       outline: 2px solid #7dd3fc; outline-offset: 2px; border-radius: 2px;
@@ -51,6 +66,12 @@
   <div class="row">
     <div class="label" id="last-check-label"></div>
     <div id="last-check"></div>
+  </div>
+
+  <div id="history">
+    <h2 id="history-title"></h2>
+    <ul id="history-list"></ul>
+    <div id="history-empty"></div>
   </div>
 
   <div id="collected">

@@ -115,7 +115,7 @@ describe('buildStatusResponse — no secrets', () => {
     const json = JSON.stringify(resp);
     // The response schema is a closed set — assert every key.
     expect(Object.keys(resp).sort()).toEqual([
-      'collectionEnabled', 'lastStepUpAt', 'lastStepUpDecision',
+      'collectionEnabled', 'decisionHistory', 'lastStepUpAt', 'lastStepUpDecision',
       'lastStepUpSuccess', 'level', 'reasonCode', 'serverBackoffRemainingMs',
       'version',
     ]);
